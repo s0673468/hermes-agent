@@ -296,11 +296,16 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         return None
     if not requested_norm.startswith("custom:"):
         try:
-            auth_mod.resolve_provider(requested_norm)
+            resolved_builtin = auth_mod.resolve_provider(requested_norm)
         except AuthError:
             pass
         else:
-            return None
+            # Allow local-server aliases that intentionally route through the
+            # generic custom provider (e.g. lmstudio, ollama) to continue into
+            # named custom-provider resolution. Other recognized built-ins
+            # should still bypass this path.
+            if resolved_builtin != "custom":
+                return None
 
     config = load_config()
     

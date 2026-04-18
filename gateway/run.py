@@ -1103,6 +1103,73 @@ class GatewayRunner:
                 resolved_session_key, model, runtime_kwargs
             )
 
+        sticky_binding = None
+        if source is not None and not override:
+            try:
+                from gateway.platforms.base import resolve_channel_model_binding
+
+                platform_cfg = getattr(getattr(self, "config", None), "platforms", {}).get(source.platform)
+                config_extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+                lookup_id = str(source.thread_id or source.chat_id)
+                parent_id = str(source.chat_id) if source.thread_id else None
+                sticky_binding = resolve_channel_model_binding(config_extra, lookup_id, parent_id)
+            except Exception:
+                sticky_binding = None
+
+        if sticky_binding:
+            try:
+                from hermes_cli.model_switch import switch_model as _switch_model
+
+                cfg = user_config if isinstance(user_config, dict) else _load_gateway_config()
+                user_provs = cfg.get("providers") if isinstance(cfg, dict) else None
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers
+                    custom_provs = get_compatible_custom_providers(cfg) if isinstance(cfg, dict) else None
+                except Exception:
+                    custom_provs = cfg.get("custom_providers") if isinstance(cfg, dict) else None
+
+                sticky_result = _switch_model(
+                    raw_input=sticky_binding.get("model", ""),
+                    current_provider=runtime_kwargs.get("provider", ""),
+                    current_model=model,
+                    current_base_url=runtime_kwargs.get("base_url", ""),
+                    current_api_key=runtime_kwargs.get("api_key", ""),
+                    is_global=False,
+                    explicit_provider=sticky_binding.get("provider", ""),
+                    user_providers=user_provs,
+                    custom_providers=custom_provs,
+                )
+                if sticky_result.success:
+                    model = sticky_result.new_model or model
+                    runtime_kwargs = {
+                        "provider": sticky_binding.get("provider")
+                        or sticky_result.target_provider
+                        or runtime_kwargs.get("provider"),
+                        "api_key": sticky_binding.get("api_key")
+                        or sticky_result.api_key
+                        or runtime_kwargs.get("api_key"),
+                        "base_url": sticky_binding.get("base_url")
+                        or sticky_result.base_url
+                        or runtime_kwargs.get("base_url"),
+                        "api_mode": sticky_binding.get("api_mode")
+                        or sticky_result.api_mode
+                        or runtime_kwargs.get("api_mode"),
+                    }
+                else:
+                    logger.warning(
+                        "Sticky channel model binding failed for %s:%s — %s",
+                        source.platform.value,
+                        source.chat_id,
+                        sticky_result.error_message,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to apply sticky channel model binding for %s:%s: %s",
+                    source.platform.value,
+                    source.chat_id,
+                    exc,
+                )
+
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
         # fall back to the provider's first catalog model so the API call

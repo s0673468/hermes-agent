@@ -259,6 +259,32 @@ class TestLoadGatewayConfig:
             "456": "Therapist mode",
         }
 
+    def test_bridges_telegram_channel_model_bindings_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  channel_model_bindings:\n"
+            "    -5222898508: lmstudio/qwen3.6-35b-a3b\n"
+            "    \"-1003936661337\":\n"
+            "      provider: lmstudio\n"
+            "      model: qwen3.6-35b-a3b\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].extra["channel_model_bindings"] == {
+            "-5222898508": "lmstudio/qwen3.6-35b-a3b",
+            "-1003936661337": {
+                "provider": "lmstudio",
+                "model": "qwen3.6-35b-a3b",
+            },
+        }
+
     def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

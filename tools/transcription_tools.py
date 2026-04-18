@@ -338,7 +338,21 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
 
-        segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+        try:
+            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+        except RuntimeError as e:
+            error_text = str(e)
+            if "libcublas.so.12" not in error_text:
+                raise
+
+            logger.warning(
+                "Local faster-whisper CUDA backend unavailable (%s); retrying on CPU.",
+                error_text,
+            )
+            _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
+            _local_model_name = model_name
+            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
+
         transcript = " ".join(segment.text.strip() for segment in segments)
 
         logger.info(

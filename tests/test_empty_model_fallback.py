@@ -35,6 +35,110 @@ class TestGetDefaultModelForProvider:
 class TestGatewayEmptyModelFallback:
     """Test that _resolve_session_agent_runtime fills in empty model from provider catalog."""
 
+    def test_sticky_telegram_channel_model_binding_applies(self):
+        """Per-channel Telegram model bindings should override the global default model."""
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runner.config = MagicMock(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "channel_model_bindings": {
+                            "-5222898508": "lmstudio/qwen3.6-35b-a3b",
+                        }
+                    },
+                )
+            }
+        )
+        runner._session_key_for_source = lambda source: f"telegram:{source.chat_id}"
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-5222898508",
+            chat_type="group",
+            chat_name="Qwen Group",
+        )
+
+        with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.4"), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "openai-codex",
+                 "api_key": "codex-key",
+                 "base_url": "https://chatgpt.com/backend-api/codex",
+                 "api_mode": "codex_responses",
+             }), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("hermes_cli.model_switch.switch_model") as switch_model_mock:
+            switch_model_mock.return_value = MagicMock(
+                success=True,
+                new_model="qwen3.6-35b-a3b",
+                target_provider="lmstudio",
+                api_key="",
+                base_url="http://192.168.15.9:1234/v1",
+                api_mode="chat_completions",
+            )
+
+            model, kwargs = runner._resolve_session_agent_runtime(source=source)
+
+        assert model == "qwen3.6-35b-a3b"
+        assert kwargs["provider"] == "lmstudio"
+        assert kwargs["base_url"] == "http://192.168.15.9:1234/v1"
+        switch_model_mock.assert_called_once()
+
+    def test_session_override_beats_sticky_channel_model_binding(self):
+        """Explicit /model session override should take precedence over sticky channel binding."""
+        from gateway.config import Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {
+            "telegram:-5222898508": {
+                "model": "gemma-4-26b-a4b-it",
+                "provider": "lmstudio",
+                "api_key": "",
+                "base_url": "http://192.168.15.9:1234/v1",
+                "api_mode": "chat_completions",
+            }
+        }
+        runner.config = MagicMock(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "channel_model_bindings": {
+                            "-5222898508": "lmstudio/qwen3.6-35b-a3b",
+                        }
+                    },
+                )
+            }
+        )
+        runner._session_key_for_source = lambda source: f"telegram:{source.chat_id}"
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-5222898508",
+            chat_type="group",
+            chat_name="Qwen Group",
+        )
+
+        with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.4"), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "openai-codex",
+                 "api_key": "codex-key",
+                 "base_url": "https://chatgpt.com/backend-api/codex",
+                 "api_mode": "codex_responses",
+             }):
+            model, kwargs = runner._resolve_session_agent_runtime(source=source)
+
+        assert model == "gemma-4-26b-a4b-it"
+        assert kwargs["provider"] == "lmstudio"
+        assert kwargs["base_url"] == "http://192.168.15.9:1234/v1"
+
     def test_empty_model_filled_from_provider(self):
         """When config has no model but provider is openai-codex, use first codex model."""
         from gateway.run import GatewayRunner

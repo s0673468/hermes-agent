@@ -879,6 +879,59 @@ def resolve_channel_prompt(
     return None
 
 
+def resolve_channel_model_binding(
+    config_extra: dict,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> dict | None:
+    """Resolve a sticky per-channel model binding from platform config.
+
+    Looks up ``channel_model_bindings`` in ``config.extra`` and prefers an
+    exact match on *channel_id*, then *parent_id*.
+
+    Supported values:
+    - ``"provider/model"``
+    - ``"model-only"``
+    - ``{"provider": "...", "model": "...", "base_url": "...", ...}``
+    """
+    bindings = config_extra.get("channel_model_bindings") or {}
+    if not isinstance(bindings, dict):
+        return None
+
+    for key in (channel_id, parent_id):
+        if not key:
+            continue
+        binding = bindings.get(key)
+        if binding is None:
+            continue
+
+        if isinstance(binding, str):
+            text = binding.strip()
+            if not text:
+                continue
+            if "/" in text:
+                provider, model = text.split("/", 1)
+                provider = provider.strip()
+                model = model.strip()
+                if provider and model:
+                    return {"provider": provider, "model": model}
+            return {"model": text}
+
+        if isinstance(binding, dict):
+            normalized = {}
+            for field in ("provider", "model", "api_key", "base_url", "api_mode"):
+                value = binding.get(field)
+                if value is None:
+                    continue
+                value = str(value).strip()
+                if value:
+                    normalized[field] = value
+            if normalized.get("model"):
+                return normalized
+
+    return None
+
+
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.

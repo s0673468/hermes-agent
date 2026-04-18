@@ -262,10 +262,42 @@ def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkey
 
     assert resolved["provider"] == "ai-gateway"
     assert resolved["api_mode"] == "chat_completions"
-    assert resolved["api_key"] == "ai-gateway-explicit-token"
     assert resolved["base_url"] == "https://proxy.example.com/v1"
+    assert resolved["api_key"] == "ai-gateway-explicit-token"
     assert resolved["source"] == "explicit"
     assert resolved.get("credential_pool") is None
+
+
+def test_resolve_runtime_provider_lmstudio_alias_uses_named_custom_provider(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "lmstudio",
+                    "base_url": "http://192.168.15.9:1234/v1",
+                    "api_key": "",
+                    "key_env": "LMSTUDIO_API_KEY",
+                    "api_mode": "chat_completions",
+                    "model": "qwen3.6-35b-a3b",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(rp, "get_compatible_custom_providers", lambda cfg: cfg["custom_providers"])
+    monkeypatch.setattr(rp.auth_mod, "resolve_provider", lambda requested, **kwargs: "custom")
+    monkeypatch.setenv("LMSTUDIO_API_KEY", "test-lmstudio-key")
+
+    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["base_url"] == "http://192.168.15.9:1234/v1"
+    assert resolved["api_key"] == "test-lmstudio-key"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["model"] == "qwen3.6-35b-a3b"
+    assert resolved["source"] == "custom_provider:lmstudio"
+    assert resolved["requested_provider"] == "lmstudio"
 
 
 def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
