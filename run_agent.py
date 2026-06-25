@@ -37,13 +37,16 @@ import time
 import threading
 from types import SimpleNamespace
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from openai import OpenAI
 import fire
 from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+
+if TYPE_CHECKING:
+    from agent.rate_limit_tracker import RateLimitState
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
