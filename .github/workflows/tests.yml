@@ -33,7 +33,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
+          uv venv --seed .venv --python 3.11
           source .venv/bin/activate
           uv pip install -e ".[all,dev]" ruff==0.14.4
 
