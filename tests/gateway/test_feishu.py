@@ -8,6 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, Mock, patch
 
 try:
@@ -15,6 +16,9 @@ try:
     _HAS_LARK_OAPI = True
 except ImportError:
     _HAS_LARK_OAPI = False
+
+if TYPE_CHECKING:
+    from gateway.platforms.feishu import FeishuAdapter
 
 
 def _mock_event_dispatcher_builder(mock_handler_class):

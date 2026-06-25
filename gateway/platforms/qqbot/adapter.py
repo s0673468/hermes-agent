@@ -1090,7 +1090,7 @@ class QQAdapter(BasePlatformAdapter):
         # to prevent non-image files from being sent to vision analysis.
         logger.debug(
             "[%s] Unknown media content_type '%s', defaulting to TEXT",
-            self._log_tag,
+            "QQBot",
             first_type,
         )
         return MessageType.TEXT

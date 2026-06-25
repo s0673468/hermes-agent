@@ -25,11 +25,14 @@ import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from hermes_constants import get_hermes_dir
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    import aiohttp
 
 
 def _kill_port_process(port: int) -> None:

@@ -25,7 +25,7 @@ import hmac
 import logging
 import os
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -37,6 +37,9 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import redact_phone, strip_markdown
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    import aiohttp
 
 TWILIO_API_BASE = "https://api.twilio.com/2010-04-01/Accounts"
 MAX_SMS_LENGTH = 1600  # ~10 SMS segments
