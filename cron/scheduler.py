@@ -226,6 +226,35 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _deterministic_delivery_key(job: dict, content: str) -> Optional[str]:
+    """Hash deterministic output together with its resolved destination."""
+    targets = _resolve_delivery_targets(job)
+    if len(targets) != 1:
+        return None
+
+    target = targets[0]
+    target_identity = json.dumps(
+        {
+            "platform": str(target["platform"]).lower(),
+            "chat_id": str(target["chat_id"]),
+            "thread_id": (
+                str(target["thread_id"])
+                if target.get("thread_id") is not None
+                else None
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload = (
+        b"hermes.deterministic_delivery.v1\0"
+        + target_identity
+        + b"\0"
+        + content.encode("utf-8")
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 # Media extension sets — keep in sync with gateway/platforms/base.py:_process_message_background
 _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a'})
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -1199,10 +1228,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 delivery_key = None
                 duplicate = False
                 if success and deterministic and job.get("deduplicate_delivery"):
-                    delivery_key = hashlib.sha256(
-                        final_response.encode("utf-8")
-                    ).hexdigest()
-                    duplicate = delivery_key == job.get("last_delivery_key")
+                    delivery_key = _deterministic_delivery_key(job, final_response)
+                    duplicate = (
+                        delivery_key is not None
+                        and delivery_key == job.get("last_delivery_key")
+                    )
                     if duplicate:
                         should_deliver = False
                         logger.info(
