@@ -18,6 +18,7 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    trigger_job,
     remove_job,
     mark_job_run,
     advance_next_run,
@@ -195,6 +196,9 @@ class TestJobCRUD:
         assert job["prompt"] == "Check server status"
         assert job["enabled"] is True
         assert job["schedule"]["kind"] == "once"
+        assert job["execution_mode"] == "agent"
+        assert job["archive_output"] is True
+        assert job["deduplicate_delivery"] is False
 
         fetched = get_job(job["id"])
         assert fetched is not None
@@ -368,6 +372,110 @@ class TestMarkJobRun:
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "model timeout"
         assert updated["last_delivery_error"] == "platform 'discord' not enabled"
+
+    def test_deterministic_delivery_key_advances_only_after_delivery(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="brief.py",
+            execution_mode="script",
+            deduplicate_delivery=True,
+            deliver="telegram",
+        )
+
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_error="network timeout",
+            delivered_key="a" * 64,
+        )
+        failed = get_job(job["id"])
+        assert failed["last_delivery_key"] is None
+        assert failed["repeat"]["completed"] == 0
+
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_error=None,
+            delivered_key="a" * 64,
+        )
+        delivered = get_job(job["id"])
+        assert delivered["last_delivery_key"] == "a" * 64
+        assert delivered["repeat"]["completed"] == 1
+
+    def test_delivery_target_change_clears_deterministic_key(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="brief.py",
+            execution_mode="script",
+            deduplicate_delivery=True,
+            deliver="telegram",
+        )
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_error=None,
+            delivered_key="a" * 64,
+        )
+
+        updated = update_job(job["id"], {"deliver": "discord"})
+
+        assert updated["last_delivery_key"] is None
+
+    def test_failed_one_shot_deterministic_job_remains_retryable(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="30m",
+            script="brief.py",
+            execution_mode="script",
+        )
+
+        mark_job_run(job["id"], success=False, error="script failed")
+
+        failed = get_job(job["id"])
+        assert failed is not None
+        assert failed["repeat"]["completed"] == 0
+        assert failed["enabled"] is True
+        assert failed["state"] == "scheduled"
+        assert failed["next_run_at"] is not None
+        assert trigger_job(job["id"])["enabled"] is True
+
+    def test_resume_preserves_failed_one_shot_deterministic_retry(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="30m",
+            script="brief.py",
+            execution_mode="script",
+        )
+        mark_job_run(job["id"], success=False, error="script failed")
+        retry_at = get_job(job["id"])["next_run_at"]
+
+        pause_job(job["id"], reason="maintenance")
+        resumed = resume_job(job["id"])
+
+        assert retry_at is not None
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["next_run_at"] == retry_at
+
+    def test_schedule_edit_clears_paused_deterministic_retry(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="30m",
+            script="brief.py",
+            execution_mode="script",
+        )
+        mark_job_run(job["id"], success=False, error="script failed")
+        retry_at = get_job(job["id"])["next_run_at"]
+        pause_job(job["id"], reason="maintenance")
+
+        edited = update_job(job["id"], {"schedule": "2h"})
+        resumed = resume_job(job["id"])
+
+        assert edited["deterministic_retry_at"] is None
+        assert resumed["next_run_at"] is not None
+        assert resumed["next_run_at"] != retry_at
 
 
 class TestAdvanceNextRun:

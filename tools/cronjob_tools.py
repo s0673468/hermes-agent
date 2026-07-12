@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -150,7 +151,31 @@ def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash:
     return text or None
 
 
-def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
+def _secure_deterministic_script_dirs(scripts_dir: Path) -> Optional[str]:
+    """Create and tighten deterministic-script directories to owner-only."""
+    hermes_home = scripts_dir.parent
+    try:
+        scripts_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        current_uid = os.getuid() if hasattr(os, "getuid") else None
+        for path, label in (
+            (hermes_home, "HERMES_HOME"),
+            (scripts_dir, "deterministic scripts directory"),
+        ):
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                return f"{label} must be a real directory"
+            if current_uid is not None and metadata.st_uid != current_uid:
+                return f"{label} must be owned by the current user"
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                path.chmod(0o700)
+    except OSError as exc:
+        return f"Could not secure deterministic script directories: {exc}"
+    return None
+
+
+def _validate_cron_script_path(
+    script: Optional[str], *, owner_only: bool = False
+) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
     Scripts must be relative paths that resolve within HERMES_HOME/scripts/.
@@ -179,7 +204,12 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     from tools.path_security import validate_within_dir
 
     scripts_dir = get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
+    if owner_only:
+        security_error = _secure_deterministic_script_dirs(scripts_dir)
+        if security_error:
+            return security_error
+    else:
+        scripts_dir.mkdir(parents=True, exist_ok=True)
     containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
     if containment_error:
         return (
@@ -208,6 +238,9 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
         "last_delivery_error": job.get("last_delivery_error"),
+        "execution_mode": job.get("execution_mode", "agent"),
+        "archive_output": job.get("archive_output", True),
+        "deduplicate_delivery": job.get("deduplicate_delivery", False),
         "enabled": job.get("enabled", True),
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
@@ -234,6 +267,9 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    execution_mode: Optional[str] = None,
+    archive_output: Optional[bool] = None,
+    deduplicate_delivery: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -246,7 +282,8 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
-            if not prompt and not canonical_skills:
+            requested_mode = execution_mode or "agent"
+            if requested_mode != "script" and not prompt and not canonical_skills:
                 return tool_error("create requires either prompt or at least one skill", success=False)
             if prompt:
                 scan_error = _scan_cron_prompt(prompt)
@@ -255,7 +292,9 @@ def cronjob(
 
             # Validate script path before storing
             if script:
-                script_error = _validate_cron_script_path(script)
+                script_error = _validate_cron_script_path(
+                    script, owner_only=requested_mode == "script"
+                )
                 if script_error:
                     return tool_error(script_error, success=False)
 
@@ -271,6 +310,11 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                execution_mode=requested_mode,
+                archive_output=True if archive_output is None else archive_output,
+                deduplicate_delivery=(
+                    False if deduplicate_delivery is None else deduplicate_delivery
+                ),
             )
             return json.dumps(
                 {
@@ -334,6 +378,7 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            final_mode = execution_mode or job.get("execution_mode", "agent")
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -355,11 +400,22 @@ def cronjob(
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
             if script is not None:
                 # Pass empty string to clear an existing script
-                if script:
-                    script_error = _validate_cron_script_path(script)
-                    if script_error:
-                        return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if execution_mode is not None:
+                updates["execution_mode"] = execution_mode
+            if archive_output is not None:
+                updates["archive_output"] = archive_output
+            if deduplicate_delivery is not None:
+                updates["deduplicate_delivery"] = deduplicate_delivery
+            final_script = (
+                updates.get("script") if script is not None else job.get("script")
+            )
+            if final_script:
+                script_error = _validate_cron_script_path(
+                    str(final_script), owner_only=final_mode == "script"
+                )
+                if script_error:
+                    return tool_error(script_error, success=False)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -390,6 +446,8 @@ CRONJOB_SCHEMA = {
     "description": """Manage scheduled cron jobs with a single compressed tool.
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
+Trusted local scripts can instead use execution_mode='script' to deliver stdout
+without a model call. Script mode forbids prompts, skills, and model overrides.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
@@ -459,6 +517,19 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": f"Optional path to a Python script that runs before each cron job execution. Its stdout is injected into the prompt as context. Use for data collection and change detection. Relative paths resolve under {display_hermes_home()}/scripts/. On update, pass empty string to clear."
             },
+            "execution_mode": {
+                "type": "string",
+                "enum": ["agent", "script"],
+                "description": "Default agent runs a model turn. Script runs a trusted local Python script and delivers its bounded UTF-8 stdout as the message body without creating an agent/session."
+            },
+            "archive_output": {
+                "type": "boolean",
+                "description": "Whether to retain a local cron output artifact. Defaults true for backward compatibility; set false for ephemeral deterministic reports."
+            },
+            "deduplicate_delivery": {
+                "type": "boolean",
+                "description": "Script mode only, with one delivery target. Suppress delivery when the exact stdout SHA-256 was already delivered successfully."
+            },
         },
         "required": ["action"]
     }
@@ -503,6 +574,9 @@ registry.register(
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
+        execution_mode=args.get("execution_mode"),
+        archive_output=args.get("archive_output"),
+        deduplicate_delivery=args.get("deduplicate_delivery"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

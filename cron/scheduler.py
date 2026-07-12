@@ -11,11 +11,16 @@ runs at a time if multiple processes overlap.
 import asyncio
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -79,8 +84,8 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
-# response with this marker to suppress delivery.  Output is still saved
-# locally for audit.
+# response with this marker to suppress delivery. Agent jobs retain output by
+# default; an explicit archive_output=false contract skips that artifact.
 SILENT_MARKER = "[SILENT]"
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
@@ -224,6 +229,35 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _deterministic_delivery_key(job: dict, content: str) -> Optional[str]:
+    """Hash deterministic output together with its resolved destination."""
+    targets = _resolve_delivery_targets(job)
+    if len(targets) != 1:
+        return None
+
+    target = targets[0]
+    target_identity = json.dumps(
+        {
+            "platform": str(target["platform"]).lower(),
+            "chat_id": str(target["chat_id"]),
+            "thread_id": (
+                str(target["thread_id"])
+                if target.get("thread_id") is not None
+                else None
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload = (
+        b"hermes.deterministic_delivery.v1\0"
+        + target_identity
+        + b"\0"
+        + content.encode("utf-8")
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 # Media extension sets — keep in sync with gateway/platforms/base.py:_process_message_background
 _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a'})
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -304,6 +338,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         "qqbot": Platform.QQBOT,
     }
 
+    exact_output = job.get("execution_mode", "agent") == "script"
+
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
@@ -314,7 +350,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
+    if wrap_response and not exact_output:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
@@ -327,9 +363,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     else:
         delivery_content = content
 
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
-    from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    # Deterministic scripts are an application-text contract. Cron does not
+    # interpret MEDIA tags, add wrappers, or trim whitespace on this path;
+    # the selected platform still applies its normal transport escaping.
+    if exact_output:
+        media_files, cleaned_delivery_content = [], delivery_content
+    else:
+        from gateway.platforms.base import BasePlatformAdapter
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
 
     try:
         config = load_gateway_config()
@@ -375,7 +416,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = (
+                    cleaned_delivery_content
+                    if exact_output
+                    else cleaned_delivery_content.strip()
+                )
                 adapter_ok = True
                 if text_to_send:
                     future = asyncio.run_coroutine_threadsafe(
@@ -383,8 +428,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                     )
                     send_result = future.result(timeout=60)
-                    if send_result and not getattr(send_result, "success", True):
-                        err = getattr(send_result, "error", "unknown")
+                    acknowledged = (
+                        send_result is not None
+                        and getattr(send_result, "success", False) is True
+                    )
+                    if (exact_output and not acknowledged) or (
+                        not exact_output
+                        and send_result
+                        and not getattr(send_result, "success", True)
+                    ):
+                        err = getattr(send_result, "error", "no success acknowledgement")
                         logger.warning(
                             "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
                             job["id"], platform_name, chat_id, err,
@@ -437,6 +490,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
+            if exact_output and not (
+                isinstance(result, dict) and result.get("success") is True
+            ):
+                msg = "delivery error: target returned no success acknowledgement"
+                logger.error("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
@@ -446,6 +506,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
+_MAX_DETERMINISTIC_OUTPUT_UNITS = 1800
+_MAX_DETERMINISTIC_CAPTURE_BYTES = _MAX_DETERMINISTIC_OUTPUT_UNITS * 4
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
@@ -564,6 +626,185 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
+def _deterministic_script_path(script_path: str) -> tuple[Path | None, str | None]:
+    """Resolve an owner-controlled regular script without following symlinks."""
+    from hermes_constants import get_hermes_home
+
+    raw = Path(str(script_path or ""))
+    if not str(script_path or "").strip() or raw.is_absolute() or str(raw).startswith("~"):
+        return None, "Deterministic script path must be relative to HERMES_HOME/scripts"
+    hermes_home = get_hermes_home()
+    scripts_dir = hermes_home / "scripts"
+    try:
+        home_info = hermes_home.lstat()
+        if hermes_home.is_symlink() or not stat.S_ISDIR(home_info.st_mode):
+            return None, "Unsafe HERMES_HOME for deterministic scripts"
+        current_uid = os.getuid() if hasattr(os, "getuid") else None
+        if current_uid is not None and home_info.st_uid != current_uid:
+            return None, "Unsafe HERMES_HOME owner for deterministic scripts"
+        if stat.S_IMODE(home_info.st_mode) & 0o077:
+            return None, "HERMES_HOME must be owner-only for deterministic scripts"
+        root_info = scripts_dir.lstat()
+        if scripts_dir.is_symlink() or not stat.S_ISDIR(root_info.st_mode):
+            return None, "Unsafe deterministic scripts directory"
+        if current_uid is not None and root_info.st_uid != current_uid:
+            return None, "Unsafe deterministic scripts directory owner"
+        if stat.S_IMODE(root_info.st_mode) & 0o077:
+            return None, "Deterministic scripts directory must be owner-only"
+        scripts_root = scripts_dir.resolve(strict=True)
+        path = scripts_root / raw
+        current = scripts_root
+        for index, part in enumerate(raw.parts):
+            if part in {"", ".", ".."}:
+                return None, "Unsafe deterministic script path"
+            current /= part
+            if current.is_symlink():
+                return None, "Unsafe deterministic script symlink"
+            if index < len(raw.parts) - 1:
+                component = current.lstat()
+                if not stat.S_ISDIR(component.st_mode):
+                    return None, "Unsafe deterministic script path component"
+                if current_uid is not None and component.st_uid != current_uid:
+                    return None, "Unsafe deterministic script path component owner"
+                if stat.S_IMODE(component.st_mode) & 0o077:
+                    return None, "Deterministic script path components must be owner-only"
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(scripts_root)
+        info = resolved.stat()
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return None, "Deterministic script is missing or outside HERMES_HOME/scripts"
+    if not stat.S_ISREG(info.st_mode) or (
+        current_uid is not None and info.st_uid != current_uid
+    ):
+        return None, "Unsafe deterministic script owner or file type"
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        return None, "Deterministic script must be owner-only"
+    return resolved, None
+
+
+def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
+    """Run a trusted local script and preserve its bounded UTF-8 stdout."""
+    if os.name != "posix":
+        return False, "Deterministic script execution requires POSIX containment"
+    path, problem = _deterministic_script_path(script_path)
+    if path is None:
+        return False, problem or "Unsafe deterministic script"
+    process: subprocess.Popen[bytes] | None = None
+
+    def terminate_process_tree() -> None:
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+    timeout = _get_script_timeout()
+    limit_wrapper = (
+        "import os,resource,sys;"
+        "n=int(sys.argv[1]);"
+        "resource.setrlimit(resource.RLIMIT_FSIZE,(n,n));"
+        "os.execv(sys.executable,[sys.executable,sys.argv[2]])"
+    )
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    limit_wrapper,
+                    str(_MAX_DETERMINISTIC_CAPTURE_BYTES),
+                    str(path),
+                ],
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=str(path.parent),
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + timeout
+            overflow_stream = None
+            while process.poll() is None:
+                for stream_name, stream in (
+                    ("stdout", stdout_file),
+                    ("stderr", stderr_file),
+                ):
+                    if os.fstat(stream.fileno()).st_size >= _MAX_DETERMINISTIC_CAPTURE_BYTES:
+                        overflow_stream = stream_name
+                        break
+                if overflow_stream is not None:
+                    terminate_process_tree()
+                    break
+                if time.monotonic() >= deadline:
+                    terminate_process_tree()
+                    return False, f"Script timed out after {timeout}s: {path}"
+                time.sleep(0.01)
+
+            # A successful direct parent may have left descendants behind. Kill its
+            # session before closing the bounded temp files; escaped descendants still
+            # inherit RLIMIT_FSIZE and cannot grow either file past the capture cap.
+            terminate_process_tree()
+            for stream_name, stream in (
+                ("stdout", stdout_file),
+                ("stderr", stderr_file),
+            ):
+                if os.fstat(stream.fileno()).st_size >= _MAX_DETERMINISTIC_CAPTURE_BYTES:
+                    overflow_stream = overflow_stream or stream_name
+            if overflow_stream is not None:
+                return False, (
+                    f"Deterministic script {overflow_stream} exceeds the capture limit "
+                    f"({_MAX_DETERMINISTIC_CAPTURE_BYTES} bytes)"
+                )
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout_bytes = stdout_file.read(_MAX_DETERMINISTIC_CAPTURE_BYTES)
+            stderr_bytes = stderr_file.read(_MAX_DETERMINISTIC_CAPTURE_BYTES)
+        except Exception as exc:
+            terminate_process_tree()
+            return False, f"Script execution failed: {exc}"
+
+    if process.returncode != 0:
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        detail = f"Script exited with code {process.returncode}"
+        if stderr:
+            try:
+                from agent.redact import redact_sensitive_text
+
+                stderr = redact_sensitive_text(stderr)
+            except Exception:
+                pass
+            detail += f": {stderr.strip()}"
+        return False, detail
+    try:
+        stdout = stdout_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "Deterministic script output is not valid UTF-8"
+    if not stdout.strip():
+        return False, "Deterministic script produced empty output"
+    output_units = len(stdout.encode("utf-16-le")) // 2
+    if output_units > _MAX_DETERMINISTIC_OUTPUT_UNITS:
+        return False, (
+            "Deterministic script output exceeds the single-message limit "
+            f"({_MAX_DETERMINISTIC_OUTPUT_UNITS} UTF-16 units)"
+        )
+    return True, stdout
+
+
+def _run_deterministic_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+    success, output = _run_deterministic_script(str(job.get("script") or ""))
+    if not success:
+        return False, output, "", output
+    return True, output, output, None
+
+
 def _build_job_prompt(job: dict) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first."""
     prompt = job.get("prompt", "")
@@ -661,6 +902,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
+    if job.get("execution_mode", "agent") == "script":
+        return _run_deterministic_job(job)
+
     from run_agent import AIAgent
     
     # Initialize SQLite session store so cron job messages are persisted
@@ -1035,18 +1279,40 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
                 success, output, final_response, error = run_job(job)
 
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
+                if job.get("archive_output", True):
+                    output_file = save_job_output(job["id"], output)
+                    if verbose:
+                        logger.info("Output saved to: %s", output_file)
 
                 # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
+                # If the agent responded with [SILENT], skip delivery. Failed
+                # jobs always deliver; output archival follows the job contract.
+                deterministic = job.get("execution_mode", "agent") == "script"
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                if (
+                    not deterministic
+                    and should_deliver
+                    and success
+                    and SILENT_MARKER in deliver_content.strip().upper()
+                ):
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
+
+                delivery_key = None
+                duplicate = False
+                if success and deterministic and job.get("deduplicate_delivery"):
+                    delivery_key = _deterministic_delivery_key(job, final_response)
+                    duplicate = (
+                        delivery_key is not None
+                        and delivery_key == job.get("last_delivery_key")
+                    )
+                    if duplicate:
+                        should_deliver = False
+                        logger.info(
+                            "Job '%s': deterministic delivery key already sent; suppressing duplicate",
+                            job["id"],
+                        )
 
                 delivery_error = None
                 if should_deliver:
@@ -1063,7 +1329,21 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                if deterministic:
+                    delivered_key = (
+                        delivery_key
+                        if success and should_deliver and delivery_error is None
+                        else None
+                    )
+                    mark_job_run(
+                        job["id"],
+                        success,
+                        error,
+                        delivery_error=delivery_error,
+                        delivered_key=delivered_key,
+                    )
+                else:
+                    mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 executed += 1
 
             except Exception as e:

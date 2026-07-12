@@ -2,7 +2,8 @@
 Cron job storage and management.
 
 Jobs are stored in ~/.hermes/cron/jobs.json
-Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
+Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md unless the
+job explicitly disables archival.
 """
 
 import copy
@@ -36,6 +37,7 @@ CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+DETERMINISTIC_RETRY_MINUTES = 5
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -61,7 +63,41 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     skills = _normalize_skill_list(normalized.get("skill"), normalized.get("skills"))
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
+    normalized.setdefault("execution_mode", "agent")
+    normalized.setdefault("archive_output", True)
+    normalized.setdefault("deduplicate_delivery", False)
+    normalized.setdefault("last_delivery_key", None)
+    normalized.setdefault("deterministic_retry_at", None)
     return normalized
+
+
+def _validate_job_definition(job: Dict[str, Any]) -> None:
+    """Reject ambiguous execution contracts before they reach the scheduler."""
+    mode = job.get("execution_mode", "agent")
+    if mode not in {"agent", "script"}:
+        raise ValueError("execution_mode must be 'agent' or 'script'")
+    for field in ("archive_output", "deduplicate_delivery"):
+        if not isinstance(job.get(field), bool):
+            raise ValueError(f"{field} must be a boolean")
+    if mode != "script":
+        if job.get("deduplicate_delivery"):
+            raise ValueError("deduplicate_delivery is supported only for script execution")
+        return
+    if job.get("deduplicate_delivery"):
+        delivery = str(job.get("deliver") or "local").strip()
+        if delivery == "local" or "," in delivery:
+            raise ValueError(
+                "deduplicate_delivery requires exactly one non-local delivery target"
+            )
+    if not str(job.get("script") or "").strip():
+        raise ValueError("deterministic script execution requires a script")
+    if str(job.get("prompt") or "").strip():
+        raise ValueError("deterministic script execution cannot include a prompt")
+    if _normalize_skill_list(job.get("skill"), job.get("skills")):
+        raise ValueError("deterministic script execution cannot include skills")
+    for field in ("model", "provider", "base_url"):
+        if job.get(field):
+            raise ValueError(f"deterministic script execution cannot include {field}")
 
 
 def _secure_dir(path: Path):
@@ -378,6 +414,9 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    execution_mode: str = "agent",
+    archive_output: bool = True,
+    deduplicate_delivery: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -397,6 +436,10 @@ def create_job(
         script: Optional path to a Python script whose stdout is injected into the
                 prompt each run.  The script runs before the agent turn, and its output
                 is prepended as context.  Useful for data collection / change detection.
+        execution_mode: ``agent`` for the existing model path or ``script`` for
+                bounded trusted-script stdout delivery without a model/session.
+        archive_output: Retain the normal per-run output artifact when true.
+        deduplicate_delivery: Script mode only; suppress stdout already delivered.
 
     Returns:
         The created job dict
@@ -439,6 +482,11 @@ def create_job(
         "provider": normalized_provider,
         "base_url": normalized_base_url,
         "script": normalized_script,
+        "execution_mode": execution_mode,
+        "archive_output": archive_output,
+        "deduplicate_delivery": deduplicate_delivery,
+        "last_delivery_key": None,
+        "deterministic_retry_at": None,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -459,6 +507,7 @@ def create_job(
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
     }
+    _validate_job_definition(job)
 
     jobs = load_jobs()
     jobs.append(job)
@@ -493,6 +542,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates
+        if any(
+            field in updates and updated.get(field) != job.get(field)
+            for field in ("deliver", "execution_mode", "deduplicate_delivery")
+        ):
+            updated["last_delivery_key"] = None
 
         if "skills" in updates or "skill" in updates:
             normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
@@ -500,6 +554,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated["skill"] = normalized_skills[0] if normalized_skills else None
 
         if schedule_changed:
+            updated["deterministic_retry_at"] = None
             updated_schedule = updated["schedule"]
             # The API may pass schedule as a raw string (e.g. "every 10m")
             # instead of a pre-parsed dict.  Normalize it the same way
@@ -517,6 +572,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
+        _validate_job_definition(updated)
         jobs[i] = updated
         save_jobs(jobs)
         return _apply_skill_fields(jobs[i])
@@ -542,7 +598,19 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
-    next_run_at = compute_next_run(job["schedule"])
+    retry_at = job.get("deterministic_retry_at")
+    preserve_deterministic_retry = (
+        job.get("execution_mode", "agent") == "script"
+        and job.get("schedule", {}).get("kind") == "once"
+        and job.get("last_run_at") is not None
+        and retry_at is not None
+        and job.get("next_run_at") == retry_at
+    )
+    next_run_at = (
+        retry_at
+        if preserve_deterministic_retry
+        else compute_next_run(job["schedule"])
+    )
     return update_job(
         job_id,
         {
@@ -568,6 +636,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": _hermes_now().isoformat(),
+            "deterministic_retry_at": None,
         },
     )
 
@@ -584,7 +653,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 delivered_key: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -597,15 +667,20 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     jobs = load_jobs()
     for i, job in enumerate(jobs):
         if job["id"] == job_id:
-            now = _hermes_now().isoformat()
+            now_value = _hermes_now()
+            now = now_value.isoformat()
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
             job["last_error"] = error if not success else None
             # Track delivery failures separately — cleared on successful delivery
             job["last_delivery_error"] = delivery_error
+            completed_successfully = success and delivery_error is None
+            if delivered_key is not None and completed_successfully:
+                job["last_delivery_key"] = delivered_key
             
             # Increment completed count
-            if job.get("repeat"):
+            count_run = completed_successfully or job.get("execution_mode", "agent") != "script"
+            if job.get("repeat") and count_run:
                 job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
                 
                 # Check if we've hit the repeat limit
@@ -617,8 +692,18 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     save_jobs(jobs)
                     return
             
-            # Compute next run
-            job["next_run_at"] = compute_next_run(job["schedule"], now)
+            deterministic_retry = (
+                job.get("execution_mode", "agent") == "script"
+                and not completed_successfully
+            )
+            if deterministic_retry and job.get("schedule", {}).get("kind") == "once":
+                job["next_run_at"] = (
+                    now_value + timedelta(minutes=DETERMINISTIC_RETRY_MINUTES)
+                ).isoformat()
+                job["deterministic_retry_at"] = job["next_run_at"]
+            else:
+                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                job["deterministic_retry_at"] = None
 
             # If no next run (one-shot completed), disable
             if job["next_run_at"] is None:

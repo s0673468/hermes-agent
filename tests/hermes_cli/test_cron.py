@@ -105,3 +105,28 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "find-nearby"]
         assert jobs[0]["name"] == "Skill combo"
+
+    def test_create_deterministic_script_job(self, tmp_cron_dir, capsys):
+        result = cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 1h",
+                prompt="",
+                name="Deterministic report",
+                deliver="telegram",
+                repeat=None,
+                skill=None,
+                skills=None,
+                script="report.py",
+                execution_mode="script",
+                archive_output=False,
+                deduplicate_delivery=True,
+            )
+        )
+
+        assert result == 0
+        job = list_jobs()[0]
+        assert job["execution_mode"] == "script"
+        assert job["archive_output"] is False
+        assert job["deduplicate_delivery"] is True
+        assert "Created job" in capsys.readouterr().out

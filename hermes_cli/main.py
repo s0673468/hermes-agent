@@ -6896,6 +6896,24 @@ For more help on a command:
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run",
     )
+    cron_create.add_argument(
+        "--execution-mode",
+        choices=("agent", "script"),
+        default=None,
+        help="agent (default) or trusted deterministic script stdout delivery",
+    )
+    cron_create.add_argument(
+        "--archive-output",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="retain a local cron output artifact (default: yes)",
+    )
+    cron_create.add_argument(
+        "--deduplicate-delivery",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="script mode: suppress stdout already delivered successfully",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -6933,6 +6951,21 @@ For more help on a command:
     cron_edit.add_argument(
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--execution-mode", choices=("agent", "script"), help="Change execution mode"
+    )
+    cron_edit.add_argument(
+        "--archive-output",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="retain a local cron output artifact",
+    )
+    cron_edit.add_argument(
+        "--deduplicate-delivery",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="script mode: suppress stdout already delivered successfully",
     )
 
     # lifecycle actions

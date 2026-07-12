@@ -267,6 +267,7 @@ TIPS = [
     "BOOT.md at ~/.hermes/BOOT.md runs automatically on every gateway start — use it for startup checks.",
     "Cron jobs can attach a Python script (--script) whose stdout is injected into the prompt as context.",
     "Cron scripts live in ~/.hermes/scripts/ and run before the agent — perfect for data collection pipelines.",
+    "Trusted renderers can use --execution-mode script for exact stdout delivery with no model call.",
     "prefill_messages_file in config.yaml injects few-shot examples into every API call, never saved to history.",
     "SOUL.md completely replaces the agent's default identity — rewrite it to make Hermes your own.",
     "SOUL.md is auto-seeded with a default personality on first run. Edit ~/.hermes/SOUL.md to customize.",
@@ -344,6 +345,5 @@ def get_random_tip(exclude_recent: int = 0) -> str:
             deduplication across sessions.
     """
     return random.choice(TIPS)
-
 
 

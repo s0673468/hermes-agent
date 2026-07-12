@@ -12,8 +12,10 @@ import os
 import stat
 import sys
 import textwrap
+import time
+import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -29,6 +31,10 @@ def cron_env(tmp_path, monkeypatch):
     (hermes_home / "cron").mkdir()
     (hermes_home / "cron" / "output").mkdir()
     (hermes_home / "scripts").mkdir()
+    hermes_home.chmod(0o700)
+    (hermes_home / "cron").chmod(0o700)
+    (hermes_home / "cron" / "output").chmod(0o700)
+    (hermes_home / "scripts").chmod(0o700)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     # Clear cached module-level paths
@@ -86,6 +92,335 @@ class TestJobScriptField:
 
         updated = update_job(job["id"], {"script": None})
         assert updated.get("script") is None
+
+
+class TestDeterministicScriptJobs:
+    """Deterministic jobs deliver trusted script stdout without an agent turn."""
+
+    def test_create_stores_deterministic_delivery_contract(self, cron_env):
+        from cron.jobs import create_job
+
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="brief.py",
+            execution_mode="script",
+            archive_output=False,
+            deduplicate_delivery=True,
+            deliver="telegram",
+        )
+
+        assert job["execution_mode"] == "script"
+        assert job["archive_output"] is False
+        assert job["deduplicate_delivery"] is True
+        assert job["last_delivery_key"] is None
+
+    def test_deterministic_job_requires_script_and_rejects_agent_fields(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="requires a script"):
+            create_job(prompt="", schedule="every 1h", execution_mode="script")
+        with pytest.raises(ValueError, match="cannot include a prompt"):
+            create_job(
+                prompt="summarize this",
+                schedule="every 1h",
+                script="brief.py",
+                execution_mode="script",
+            )
+        with pytest.raises(ValueError, match="non-local delivery target"):
+            create_job(
+                prompt="",
+                schedule="every 1h",
+                script="brief.py",
+                execution_mode="script",
+                deduplicate_delivery=True,
+                deliver="telegram,discord",
+            )
+        with pytest.raises(ValueError, match="non-local"):
+            create_job(
+                prompt="",
+                schedule="every 1h",
+                script="brief.py",
+                execution_mode="script",
+                deduplicate_delivery=True,
+                deliver="local",
+            )
+
+    def test_run_job_bypasses_agent_and_session_and_preserves_stdout(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "brief.py"
+        script.write_text(
+            'import sys\nsys.stdout.write("  exact first line\\nsecond line\\n")\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        job = {
+            "id": "deterministic",
+            "name": "deterministic",
+            "prompt": "",
+            "script": "brief.py",
+            "execution_mode": "script",
+        }
+
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = MagicMock()
+        fake_state = types.ModuleType("hermes_state")
+        fake_state.SessionDB = MagicMock()
+        with patch.dict(
+            sys.modules,
+            {"run_agent": fake_run_agent, "hermes_state": fake_state},
+        ):
+            success, output, final_response, error = run_job(job)
+
+        expected = "  exact first line\nsecond line\n"
+        assert (success, output, final_response, error) == (True, expected, expected, None)
+        fake_run_agent.AIAgent.assert_not_called()
+        fake_state.SessionDB.assert_not_called()
+
+    def test_deterministic_job_fails_closed_on_unsafe_script(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "unsafe.py"
+        script.write_text('print("unsafe")\n', encoding="utf-8")
+        script.chmod(0o722)
+        job = {
+            "id": "unsafe",
+            "name": "unsafe",
+            "prompt": "",
+            "script": "unsafe.py",
+            "execution_mode": "script",
+        }
+
+        success, _output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "owner-only" in error.lower()
+
+    def test_deterministic_job_rejects_symlinked_script(self, cron_env):
+        from cron.scheduler import run_job
+
+        target = cron_env / "scripts" / "target.py"
+        target.write_text('print("unsafe alias")\n', encoding="utf-8")
+        target.chmod(0o700)
+        (cron_env / "scripts" / "alias.py").symlink_to(target)
+        job = {
+            "id": "symlink",
+            "name": "symlink",
+            "prompt": "",
+            "script": "alias.py",
+            "execution_mode": "script",
+        }
+
+        success, _output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "symlink" in error.lower()
+
+    def test_deterministic_job_rejects_writable_nested_directory(self, cron_env):
+        from cron.scheduler import run_job
+
+        nested = cron_env / "scripts" / "writable"
+        nested.mkdir(mode=0o777)
+        nested.chmod(0o777)
+        script = nested / "report.py"
+        script.write_text('print("unsafe parent")\n', encoding="utf-8")
+        script.chmod(0o700)
+        job = {
+            "id": "nested",
+            "name": "nested",
+            "prompt": "",
+            "script": "writable/report.py",
+            "execution_mode": "script",
+        }
+
+        success, _output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "owner-only" in error.lower()
+
+    def test_deterministic_job_requires_owner_only_hermes_home(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "brief.py"
+        script.write_text('print("private")\n', encoding="utf-8")
+        script.chmod(0o700)
+        cron_env.chmod(0o755)
+
+        success, _output, final_response, error = run_job(
+            {
+                "id": "insecure-home",
+                "name": "insecure-home",
+                "prompt": "",
+                "script": "brief.py",
+                "execution_mode": "script",
+            }
+        )
+
+        assert success is False
+        assert final_response == ""
+        assert "hermes_home" in error.lower()
+
+    def test_deterministic_job_fails_closed_on_nonzero_exit(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "fail.py"
+        script.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+        script.chmod(0o700)
+        job = {
+            "id": "failure",
+            "name": "failure",
+            "prompt": "",
+            "script": "fail.py",
+            "execution_mode": "script",
+        }
+
+        success, _output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "code 7" in error
+
+    def test_deterministic_job_ignores_non_utf8_stderr_on_success(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "stderr_bytes.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.write('health brief\\n')\n"
+            "sys.stderr.buffer.write(b'\\xff')\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+
+        success, output, final_response, error = run_job(
+            {
+                "id": "stderr-bytes",
+                "name": "stderr-bytes",
+                "prompt": "",
+                "script": "stderr_bytes.py",
+                "execution_mode": "script",
+            }
+        )
+
+        assert success is True
+        assert output == "health brief\n"
+        assert final_response == output
+        assert error is None
+
+    def test_deterministic_job_rejects_oversized_output(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "large.py"
+        script.write_text('print("x" * 1801, end="")\n', encoding="utf-8")
+        script.chmod(0o700)
+
+        success, _output, final_response, error = run_job(
+            {
+                "id": "large",
+                "name": "large",
+                "prompt": "",
+                "script": "large.py",
+                "execution_mode": "script",
+            }
+        )
+
+        assert success is False
+        assert final_response == ""
+        assert "single-message limit" in error
+
+    def test_deterministic_job_terminates_output_above_capture_limit(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "unbounded.py"
+        script.write_text(
+            'import sys\nsys.stdout.write("x" * 200_000)\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+
+        success, _output, final_response, error = run_job(
+            {
+                "id": "unbounded",
+                "name": "unbounded",
+                "prompt": "",
+                "script": "unbounded.py",
+                "execution_mode": "script",
+            }
+        )
+
+        assert success is False
+        assert final_response == ""
+        assert "capture limit" in error
+
+    def test_deterministic_job_terminates_descendants_holding_pipes(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "descendant.py"
+        script.write_text(
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(3)'], start_new_session=True)\n"
+            "print('health brief')\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+
+        started = time.monotonic()
+        success, output, final_response, error = run_job(
+            {
+                "id": "descendant",
+                "name": "descendant",
+                "prompt": "",
+                "script": "descendant.py",
+                "execution_mode": "script",
+            }
+        )
+        elapsed = time.monotonic() - started
+
+        assert (success, output, final_response, error) == (
+            True,
+            "health brief\n",
+            "health brief\n",
+            None,
+        )
+        assert elapsed < 2.0
+
+    def test_deterministic_job_fails_closed_without_posix_containment(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler
+
+        monkeypatch.setattr(scheduler.os, "name", "nt")
+
+        success, error = scheduler._run_deterministic_script("brief.py")
+
+        assert success is False
+        assert "POSIX containment" in error
+
+    def test_deterministic_job_rejects_whitespace_only_output(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "blank.py"
+        script.write_text('print("   ")\n', encoding="utf-8")
+        script.chmod(0o700)
+
+        success, _output, final_response, error = run_job(
+            {
+                "id": "blank",
+                "name": "blank",
+                "prompt": "",
+                "script": "blank.py",
+                "execution_mode": "script",
+            }
+        )
+
+        assert success is False
+        assert final_response == ""
+        assert "empty output" in error
 
 
 class TestRunJobScript:

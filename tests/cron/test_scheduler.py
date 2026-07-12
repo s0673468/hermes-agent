@@ -7,7 +7,16 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import (
+    SILENT_MARKER,
+    _build_job_prompt,
+    _deliver_result,
+    _deterministic_delivery_key,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    run_job,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -628,6 +637,28 @@ class TestDeliverResultErrorReturns:
         assert result is not None
         assert "no delivery target" in result
 
+    def test_script_mode_requires_explicit_standalone_success_ack(self, monkeypatch):
+        from gateway.config import Platform
+
+        monkeypatch.setattr(
+            "cron.scheduler._resolve_delivery_targets",
+            lambda _job: [{"platform": "telegram", "chat_id": "1", "thread_id": None}],
+        )
+        pconfig = MagicMock(enabled=True)
+        config = MagicMock()
+        config.platforms = {Platform.TELEGRAM: pconfig}
+        with patch("gateway.config.load_gateway_config", return_value=config), patch(
+            "tools.send_message_tool._send_to_platform",
+            new=AsyncMock(return_value=None),
+        ):
+            result = _deliver_result(
+                {"id": "script", "deliver": "telegram", "execution_mode": "script"},
+                "report\n",
+            )
+
+        assert result is not None
+        assert "no success acknowledgement" in result
+
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
@@ -1143,6 +1174,168 @@ class TestSilentDelivery:
             tick(verbose=False)
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
+
+
+class TestDeterministicDelivery:
+    def _job(self, **overrides):
+        job = {
+            "id": "daily-brief",
+            "name": "daily brief",
+            "execution_mode": "script",
+            "archive_output": False,
+            "deduplicate_delivery": True,
+            "last_delivery_key": None,
+            "deliver": "telegram",
+        }
+        job.update(overrides)
+        return job
+
+    def test_tick_delivers_exact_stdout_without_archive(self, tmp_path, monkeypatch):
+        from cron.scheduler import tick
+
+        content = "  exact first line\nsecond line\n"
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001")
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), patch(
+            "cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"
+        ), patch("cron.scheduler.get_due_jobs", return_value=[self._job()]), patch(
+            "cron.scheduler.advance_next_run"
+        ), patch(
+            "cron.scheduler.run_job", return_value=(True, content, content, None)
+        ), patch(
+            "cron.scheduler.save_job_output"
+        ) as save_mock, patch(
+            "cron.scheduler._deliver_result", return_value=None
+        ) as deliver_mock, patch(
+            "cron.scheduler.mark_job_run"
+        ) as mark_mock:
+            tick(verbose=False)
+
+        save_mock.assert_not_called()
+        deliver_mock.assert_called_once_with(
+            self._job(), content, adapters=None, loop=None
+        )
+        delivered_key = mark_mock.call_args.kwargs["delivered_key"]
+        assert len(delivered_key) == 64
+
+    def test_repeated_successful_delivery_key_suppresses_duplicate(self, tmp_path, monkeypatch):
+        from cron.scheduler import tick
+
+        content = "same brief\n"
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001")
+        delivery_key = _deterministic_delivery_key(self._job(), content)
+        assert delivery_key is not None
+        job = self._job(last_delivery_key=delivery_key)
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), patch(
+            "cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"
+        ), patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
+            "cron.scheduler.advance_next_run"
+        ), patch(
+            "cron.scheduler.run_job", return_value=(True, content, content, None)
+        ), patch("cron.scheduler.save_job_output") as save_mock, patch(
+            "cron.scheduler._deliver_result"
+        ) as deliver_mock, patch("cron.scheduler.mark_job_run") as mark_mock:
+            tick(verbose=False)
+
+        save_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+        assert mark_mock.call_args.kwargs["delivered_key"] is None
+
+    def test_resolved_target_change_does_not_suppress_same_content(self, tmp_path, monkeypatch):
+        from cron.scheduler import tick
+
+        content = "same brief\n"
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001")
+        old_key = _deterministic_delivery_key(self._job(), content)
+        assert old_key is not None
+
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-2002")
+        job = self._job(last_delivery_key=old_key)
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), patch(
+            "cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"
+        ), patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
+            "cron.scheduler.advance_next_run"
+        ), patch(
+            "cron.scheduler.run_job", return_value=(True, content, content, None)
+        ), patch("cron.scheduler.save_job_output"), patch(
+            "cron.scheduler._deliver_result", return_value=None
+        ) as deliver_mock, patch("cron.scheduler.mark_job_run") as mark_mock:
+            tick(verbose=False)
+
+        deliver_mock.assert_called_once()
+        new_key = mark_mock.call_args.kwargs["delivered_key"]
+        assert new_key is not None
+        assert new_key != old_key
+
+    def test_script_silent_literal_is_delivered_as_content(self, tmp_path):
+        from cron.scheduler import tick
+
+        content = "literal [SILENT] marker in factual report\n"
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), patch(
+            "cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"
+        ), patch("cron.scheduler.get_due_jobs", return_value=[self._job()]), patch(
+            "cron.scheduler.advance_next_run"
+        ), patch(
+            "cron.scheduler.run_job", return_value=(True, content, content, None)
+        ), patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, patch(
+            "cron.scheduler.mark_job_run"
+        ):
+            tick(verbose=False)
+
+        deliver_mock.assert_called_once()
+
+    def test_failed_delivery_does_not_advance_key_and_can_retry(self, tmp_path):
+        from cron.scheduler import tick
+
+        content = "retry me\n"
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), patch(
+            "cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"
+        ), patch("cron.scheduler.get_due_jobs", return_value=[self._job()]), patch(
+            "cron.scheduler.advance_next_run"
+        ), patch(
+            "cron.scheduler.run_job", return_value=(True, content, content, None)
+        ), patch("cron.scheduler.save_job_output"), patch(
+            "cron.scheduler._deliver_result", return_value="network failure"
+        ), patch("cron.scheduler.mark_job_run") as mark_mock:
+            tick(verbose=False)
+
+        assert mark_mock.call_args.kwargs["delivered_key"] is None
+        assert mark_mock.call_args.kwargs["delivery_error"] == "network failure"
+
+    def test_exact_mode_bypasses_wrapping_media_parsing_and_stripping(self, monkeypatch):
+        from gateway.config import Platform
+
+        content = "  exact first line\nsecond line\n"
+        job = self._job()
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        future = MagicMock()
+        future.result.return_value = MagicMock(success=True)
+
+        def schedule(coro, _loop):
+            coro.close()
+            return future
+
+        monkeypatch.setattr(
+            "cron.scheduler._resolve_delivery_targets",
+            lambda _job: [{"platform": "telegram", "chat_id": "1", "thread_id": None}],
+        )
+        gateway_config = MagicMock()
+        gateway_config.platforms = {}
+        with patch("gateway.config.load_gateway_config", return_value=gateway_config), patch(
+            "asyncio.run_coroutine_threadsafe", side_effect=schedule
+        ), patch(
+            "gateway.platforms.base.BasePlatformAdapter.extract_media"
+        ) as extract_media:
+            error = _deliver_result(
+                job, content, adapters={Platform.TELEGRAM: adapter}, loop=loop
+            )
+
+        # Use a real platform key for the live-adapter lookup in the assertion below.
+        assert error is None
+        extract_media.assert_not_called()
+        adapter.send.assert_called_once_with("1", content, metadata=None)
 
 
 class TestBuildJobPromptSilentHint:

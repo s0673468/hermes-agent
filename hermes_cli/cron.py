@@ -93,6 +93,10 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        print(f"    Mode:      {job.get('execution_mode', 'agent')}")
+        print(f"    Archive:   {job.get('archive_output', True)}")
+        if job.get("deduplicate_delivery"):
+            print("    Dedup:     exact stdout")
 
         # Execution history
         last_status = job.get("last_status")
@@ -168,6 +172,9 @@ def cron_create(args):
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
+        execution_mode=getattr(args, "execution_mode", None),
+        archive_output=getattr(args, "archive_output", None),
+        deduplicate_delivery=getattr(args, "deduplicate_delivery", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -218,6 +225,9 @@ def cron_edit(args):
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
         script=getattr(args, "script", None),
+        execution_mode=getattr(args, "execution_mode", None),
+        archive_output=getattr(args, "archive_output", None),
+        deduplicate_delivery=getattr(args, "deduplicate_delivery", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
