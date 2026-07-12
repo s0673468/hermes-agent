@@ -27,7 +27,9 @@ Script-mode jobs:
 - optionally skip the normal `~/.hermes/cron/output/` artifact with
   `--no-archive-output`;
 - optionally deduplicate by SHA-256 of exact stdout. The delivery key advances
-  only after the target reports success, so failed sends remain retryable.
+only after the target reports success, so failed sends remain retryable.
+Failed one-shot script runs are rescheduled after a five-minute backoff instead
+of being marked complete, and changing the delivery target clears the prior key.
 
 Deduplication accepts one delivery target only; this avoids retrying a partially
 successful multi-target send and duplicating the targets that already received it.

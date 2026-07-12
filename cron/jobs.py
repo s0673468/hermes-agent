@@ -37,6 +37,7 @@ CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+DETERMINISTIC_RETRY_MINUTES = 5
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -539,6 +540,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates
+        if any(
+            field in updates and updated.get(field) != job.get(field)
+            for field in ("deliver", "execution_mode", "deduplicate_delivery")
+        ):
+            updated["last_delivery_key"] = None
 
         if "skills" in updates or "skill" in updates:
             normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
@@ -645,7 +651,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     jobs = load_jobs()
     for i, job in enumerate(jobs):
         if job["id"] == job_id:
-            now = _hermes_now().isoformat()
+            now_value = _hermes_now()
+            now = now_value.isoformat()
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
             job["last_error"] = error if not success else None
@@ -669,8 +676,16 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     save_jobs(jobs)
                     return
             
-            # Compute next run
-            job["next_run_at"] = compute_next_run(job["schedule"], now)
+            deterministic_retry = (
+                job.get("execution_mode", "agent") == "script"
+                and not completed_successfully
+            )
+            if deterministic_retry and job.get("schedule", {}).get("kind") == "once":
+                job["next_run_at"] = (
+                    now_value + timedelta(minutes=DETERMINISTIC_RETRY_MINUTES)
+                ).isoformat()
+            else:
+                job["next_run_at"] = compute_next_run(job["schedule"], now)
 
             # If no next run (one-shot completed), disable
             if job["next_run_at"] is None:

@@ -403,6 +403,26 @@ class TestMarkJobRun:
         assert delivered["last_delivery_key"] == "a" * 64
         assert delivered["repeat"]["completed"] == 1
 
+    def test_delivery_target_change_clears_deterministic_key(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="brief.py",
+            execution_mode="script",
+            deduplicate_delivery=True,
+            deliver="telegram",
+        )
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_error=None,
+            delivered_key="a" * 64,
+        )
+
+        updated = update_job(job["id"], {"deliver": "discord"})
+
+        assert updated["last_delivery_key"] is None
+
     def test_failed_one_shot_deterministic_job_remains_retryable(self, tmp_cron_dir):
         job = create_job(
             prompt="",
@@ -416,6 +436,9 @@ class TestMarkJobRun:
         failed = get_job(job["id"])
         assert failed is not None
         assert failed["repeat"]["completed"] == 0
+        assert failed["enabled"] is True
+        assert failed["state"] == "scheduled"
+        assert failed["next_run_at"] is not None
         assert trigger_job(job["id"])["enabled"] is True
 
 
