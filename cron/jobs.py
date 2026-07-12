@@ -67,6 +67,7 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized.setdefault("archive_output", True)
     normalized.setdefault("deduplicate_delivery", False)
     normalized.setdefault("last_delivery_key", None)
+    normalized.setdefault("deterministic_retry_at", None)
     return normalized
 
 
@@ -485,6 +486,7 @@ def create_job(
         "archive_output": archive_output,
         "deduplicate_delivery": deduplicate_delivery,
         "last_delivery_key": None,
+        "deterministic_retry_at": None,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -552,6 +554,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated["skill"] = normalized_skills[0] if normalized_skills else None
 
         if schedule_changed:
+            updated["deterministic_retry_at"] = None
             updated_schedule = updated["schedule"]
             # The API may pass schedule as a raw string (e.g. "every 10m")
             # instead of a pre-parsed dict.  Normalize it the same way
@@ -595,14 +598,16 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
+    retry_at = job.get("deterministic_retry_at")
     preserve_deterministic_retry = (
         job.get("execution_mode", "agent") == "script"
         and job.get("schedule", {}).get("kind") == "once"
         and job.get("last_run_at") is not None
-        and job.get("next_run_at") is not None
+        and retry_at is not None
+        and job.get("next_run_at") == retry_at
     )
     next_run_at = (
-        job["next_run_at"]
+        retry_at
         if preserve_deterministic_retry
         else compute_next_run(job["schedule"])
     )
@@ -631,6 +636,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": _hermes_now().isoformat(),
+            "deterministic_retry_at": None,
         },
     )
 
@@ -694,8 +700,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["next_run_at"] = (
                     now_value + timedelta(minutes=DETERMINISTIC_RETRY_MINUTES)
                 ).isoformat()
+                job["deterministic_retry_at"] = job["next_run_at"]
             else:
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
+                job["deterministic_retry_at"] = None
 
             # If no next run (one-shot completed), disable
             if job["next_run_at"] is None:

@@ -459,6 +459,24 @@ class TestMarkJobRun:
         assert resumed["state"] == "scheduled"
         assert resumed["next_run_at"] == retry_at
 
+    def test_schedule_edit_clears_paused_deterministic_retry(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="30m",
+            script="brief.py",
+            execution_mode="script",
+        )
+        mark_job_run(job["id"], success=False, error="script failed")
+        retry_at = get_job(job["id"])["next_run_at"]
+        pause_job(job["id"], reason="maintenance")
+
+        edited = update_job(job["id"], {"schedule": "2h"})
+        resumed = resume_job(job["id"])
+
+        assert edited["deterministic_retry_at"] is None
+        assert resumed["next_run_at"] is not None
+        assert resumed["next_run_at"] != retry_at
+
 
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""

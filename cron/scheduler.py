@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -506,6 +507,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
 _MAX_DETERMINISTIC_OUTPUT_UNITS = 1800
 _MAX_DETERMINISTIC_CAPTURE_BYTES = _MAX_DETERMINISTIC_OUTPUT_UNITS * 4
+_DETERMINISTIC_READER_JOIN_SECONDS = 0.5
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
@@ -690,9 +692,60 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
     overflow: list[str] = []
     overflow_lock = threading.Lock()
 
+    def terminate_process_tree() -> None:
+        if process is None:
+            return
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        elif os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def finish_readers(readers: list[threading.Thread]) -> bool:
+        for reader in readers:
+            reader.join(timeout=_DETERMINISTIC_READER_JOIN_SECONDS)
+        if all(not reader.is_alive() for reader in readers):
+            return True
+        terminate_process_tree()
+        for pipe in (
+            process.stdout if process is not None else None,
+            process.stderr if process is not None else None,
+        ):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        for reader in readers:
+            reader.join(timeout=_DETERMINISTIC_READER_JOIN_SECONDS)
+        return all(not reader.is_alive() for reader in readers)
+
     def drain(stream_name: str, pipe) -> None:
         while True:
-            chunk = pipe.read(4096)
+            try:
+                chunk = pipe.read(4096)
+            except (OSError, ValueError):
+                return
             if not chunk:
                 return
             target = buffers[stream_name]
@@ -703,19 +756,23 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
                 with overflow_lock:
                     if not overflow:
                         overflow.append(stream_name)
-                if process is not None:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
+                terminate_process_tree()
                 return
 
     try:
+        process_kwargs = {}
+        if os.name == "posix":
+            process_kwargs["start_new_session"] = True
+        elif os.name == "nt":
+            process_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
         process = subprocess.Popen(
             [sys.executable, str(path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=str(path.parent),
+            **process_kwargs,
         )
         assert process.stdout is not None
         assert process.stderr is not None
@@ -735,19 +792,15 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
         try:
             process.wait(timeout=_get_script_timeout())
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            for reader in readers:
-                reader.join()
+            terminate_process_tree()
+            finish_readers(readers)
             return False, f"Script timed out after {_get_script_timeout()}s: {path}"
-        for reader in readers:
-            reader.join()
+        if not finish_readers(readers):
+            return False, "Deterministic script output streams did not close"
     except subprocess.TimeoutExpired:
         return False, f"Script timed out after {_get_script_timeout()}s: {path}"
     except Exception as exc:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
+        terminate_process_tree()
         return False, f"Script execution failed: {exc}"
 
     if overflow:

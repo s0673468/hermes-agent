@@ -12,6 +12,7 @@ import os
 import stat
 import sys
 import textwrap
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -354,6 +355,39 @@ class TestDeterministicScriptJobs:
         assert success is False
         assert final_response == ""
         assert "capture limit" in error
+
+    def test_deterministic_job_terminates_descendants_holding_pipes(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "descendant.py"
+        script.write_text(
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(3)'])\n"
+            "print('health brief')\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+
+        started = time.monotonic()
+        success, output, final_response, error = run_job(
+            {
+                "id": "descendant",
+                "name": "descendant",
+                "prompt": "",
+                "script": "descendant.py",
+                "execution_mode": "script",
+            }
+        )
+        elapsed = time.monotonic() - started
+
+        assert (success, output, final_response, error) == (
+            True,
+            "health brief\n",
+            "health brief\n",
+            None,
+        )
+        assert elapsed < 2.0
 
     def test_deterministic_job_rejects_whitespace_only_output(self, cron_env):
         from cron.scheduler import run_job
