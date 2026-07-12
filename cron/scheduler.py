@@ -19,7 +19,8 @@ import signal
 import stat
 import subprocess
 import sys
-import threading
+import tempfile
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -507,7 +508,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
 _MAX_DETERMINISTIC_OUTPUT_UNITS = 1800
 _MAX_DETERMINISTIC_CAPTURE_BYTES = _MAX_DETERMINISTIC_OUTPUT_UNITS * 4
-_DETERMINISTIC_READER_JOIN_SECONDS = 0.5
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
@@ -684,33 +684,20 @@ def _deterministic_script_path(script_path: str) -> tuple[Path | None, str | Non
 
 def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
     """Run a trusted local script and preserve its bounded UTF-8 stdout."""
+    if os.name != "posix":
+        return False, "Deterministic script execution requires POSIX containment"
     path, problem = _deterministic_script_path(script_path)
     if path is None:
         return False, problem or "Unsafe deterministic script"
     process: subprocess.Popen[bytes] | None = None
-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
-    overflow: list[str] = []
-    overflow_lock = threading.Lock()
 
     def terminate_process_tree() -> None:
         if process is None:
             return
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif os.name == "nt":
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=5,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         if process.poll() is None:
             try:
                 process.kill()
@@ -721,95 +708,71 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
         except subprocess.TimeoutExpired:
             pass
 
-    def finish_readers(readers: list[threading.Thread]) -> bool:
-        for reader in readers:
-            reader.join(timeout=_DETERMINISTIC_READER_JOIN_SECONDS)
-        if all(not reader.is_alive() for reader in readers):
-            return True
-        terminate_process_tree()
-        for pipe in (
-            process.stdout if process is not None else None,
-            process.stderr if process is not None else None,
-        ):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
-        for reader in readers:
-            reader.join(timeout=_DETERMINISTIC_READER_JOIN_SECONDS)
-        return all(not reader.is_alive() for reader in readers)
-
-    def drain(stream_name: str, pipe) -> None:
-        while True:
-            try:
-                chunk = pipe.read(4096)
-            except (OSError, ValueError):
-                return
-            if not chunk:
-                return
-            target = buffers[stream_name]
-            remaining = _MAX_DETERMINISTIC_CAPTURE_BYTES - len(target)
-            if remaining > 0:
-                target.extend(chunk[:remaining])
-            if len(chunk) > remaining:
-                with overflow_lock:
-                    if not overflow:
-                        overflow.append(stream_name)
-                terminate_process_tree()
-                return
-
-    try:
-        process_kwargs = {}
-        if os.name == "posix":
-            process_kwargs["start_new_session"] = True
-        elif os.name == "nt":
-            process_kwargs["creationflags"] = getattr(
-                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-            )
-        process = subprocess.Popen(
-            [sys.executable, str(path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(path.parent),
-            **process_kwargs,
-        )
-        assert process.stdout is not None
-        assert process.stderr is not None
-        readers = [
-            threading.Thread(
-                target=drain,
-                args=(stream_name, pipe),
-                daemon=True,
-            )
-            for stream_name, pipe in (
-                ("stdout", process.stdout),
-                ("stderr", process.stderr),
-            )
-        ]
-        for reader in readers:
-            reader.start()
+    timeout = _get_script_timeout()
+    limit_wrapper = (
+        "import os,resource,sys;"
+        "n=int(sys.argv[1]);"
+        "resource.setrlimit(resource.RLIMIT_FSIZE,(n,n));"
+        "os.execv(sys.executable,[sys.executable,sys.argv[2]])"
+    )
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         try:
-            process.wait(timeout=_get_script_timeout())
-        except subprocess.TimeoutExpired:
-            terminate_process_tree()
-            finish_readers(readers)
-            return False, f"Script timed out after {_get_script_timeout()}s: {path}"
-        if not finish_readers(readers):
-            return False, "Deterministic script output streams did not close"
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {_get_script_timeout()}s: {path}"
-    except Exception as exc:
-        terminate_process_tree()
-        return False, f"Script execution failed: {exc}"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    limit_wrapper,
+                    str(_MAX_DETERMINISTIC_CAPTURE_BYTES),
+                    str(path),
+                ],
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=str(path.parent),
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + timeout
+            overflow_stream = None
+            while process.poll() is None:
+                for stream_name, stream in (
+                    ("stdout", stdout_file),
+                    ("stderr", stderr_file),
+                ):
+                    if os.fstat(stream.fileno()).st_size >= _MAX_DETERMINISTIC_CAPTURE_BYTES:
+                        overflow_stream = stream_name
+                        break
+                if overflow_stream is not None:
+                    terminate_process_tree()
+                    break
+                if time.monotonic() >= deadline:
+                    terminate_process_tree()
+                    return False, f"Script timed out after {timeout}s: {path}"
+                time.sleep(0.01)
 
-    if overflow:
-        return False, (
-            f"Deterministic script {overflow[0]} exceeds the capture limit "
-            f"({_MAX_DETERMINISTIC_CAPTURE_BYTES} bytes)"
-        )
+            # A successful direct parent may have left descendants behind. Kill its
+            # session before closing the bounded temp files; escaped descendants still
+            # inherit RLIMIT_FSIZE and cannot grow either file past the capture cap.
+            terminate_process_tree()
+            for stream_name, stream in (
+                ("stdout", stdout_file),
+                ("stderr", stderr_file),
+            ):
+                if os.fstat(stream.fileno()).st_size >= _MAX_DETERMINISTIC_CAPTURE_BYTES:
+                    overflow_stream = overflow_stream or stream_name
+            if overflow_stream is not None:
+                return False, (
+                    f"Deterministic script {overflow_stream} exceeds the capture limit "
+                    f"({_MAX_DETERMINISTIC_CAPTURE_BYTES} bytes)"
+                )
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout_bytes = stdout_file.read(_MAX_DETERMINISTIC_CAPTURE_BYTES)
+            stderr_bytes = stderr_file.read(_MAX_DETERMINISTIC_CAPTURE_BYTES)
+        except Exception as exc:
+            terminate_process_tree()
+            return False, f"Script execution failed: {exc}"
+
     if process.returncode != 0:
-        stderr = bytes(buffers["stderr"]).decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
         detail = f"Script exited with code {process.returncode}"
         if stderr:
             try:
@@ -821,7 +784,7 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
             detail += f": {stderr.strip()}"
         return False, detail
     try:
-        stdout = bytes(buffers["stdout"]).decode("utf-8")
+        stdout = stdout_bytes.decode("utf-8")
     except UnicodeDecodeError:
         return False, "Deterministic script output is not valid UTF-8"
     if not stdout.strip():

@@ -363,7 +363,7 @@ class TestDeterministicScriptJobs:
         script.write_text(
             "import subprocess, sys\n"
             "subprocess.Popen([sys.executable, '-c', "
-            "'import time; time.sleep(3)'])\n"
+            "'import time; time.sleep(3)'], start_new_session=True)\n"
             "print('health brief')\n",
             encoding="utf-8",
         )
@@ -388,6 +388,18 @@ class TestDeterministicScriptJobs:
             None,
         )
         assert elapsed < 2.0
+
+    def test_deterministic_job_fails_closed_without_posix_containment(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler
+
+        monkeypatch.setattr(scheduler.os, "name", "nt")
+
+        success, error = scheduler._run_deterministic_script("brief.py")
+
+        assert success is False
+        assert "POSIX containment" in error
 
     def test_deterministic_job_rejects_whitespace_only_output(self, cron_env):
         from cron.scheduler import run_job

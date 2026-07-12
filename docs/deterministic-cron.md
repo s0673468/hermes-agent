@@ -17,6 +17,8 @@ hermes cron create '0 9 * * *' \
 
 Script-mode jobs:
 
+- currently require a POSIX host; unsupported platforms fail closed because
+  the process and file-size containment guarantees are not available there;
 - run `~/.hermes/scripts/<name>.py` with the Hermes Python interpreter;
 - do not create an `AIAgent`, model request, or session database record;
 - pass bounded valid UTF-8 stdout as the message body, without cron wrappers,
@@ -26,8 +28,9 @@ Script-mode jobs:
   empty, or nonzero-exit scripts;
 - optionally skip the normal `~/.hermes/cron/output/` artifact with
   `--no-archive-output`;
-- optionally deduplicate by SHA-256 of exact stdout. The delivery key advances
-only after the target reports success, so failed sends remain retryable.
+- optionally deduplicate by SHA-256 of the resolved target identity and exact
+  stdout. The delivery key advances only after the target reports success, so
+  failed sends remain retryable.
 Failed one-shot script runs are rescheduled after a five-minute backoff instead
 of being marked complete, and changing the delivery target clears the prior key.
 
