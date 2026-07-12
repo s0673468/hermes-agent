@@ -2,7 +2,8 @@
 Cron job storage and management.
 
 Jobs are stored in ~/.hermes/cron/jobs.json
-Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
+Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md unless the
+job explicitly disables archival.
 """
 
 import copy
@@ -61,7 +62,40 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     skills = _normalize_skill_list(normalized.get("skill"), normalized.get("skills"))
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
+    normalized.setdefault("execution_mode", "agent")
+    normalized.setdefault("archive_output", True)
+    normalized.setdefault("deduplicate_delivery", False)
+    normalized.setdefault("last_delivery_key", None)
     return normalized
+
+
+def _validate_job_definition(job: Dict[str, Any]) -> None:
+    """Reject ambiguous execution contracts before they reach the scheduler."""
+    mode = job.get("execution_mode", "agent")
+    if mode not in {"agent", "script"}:
+        raise ValueError("execution_mode must be 'agent' or 'script'")
+    for field in ("archive_output", "deduplicate_delivery"):
+        if not isinstance(job.get(field), bool):
+            raise ValueError(f"{field} must be a boolean")
+    if mode != "script":
+        if job.get("deduplicate_delivery"):
+            raise ValueError("deduplicate_delivery is supported only for script execution")
+        return
+    if job.get("deduplicate_delivery"):
+        delivery = str(job.get("deliver") or "local").strip()
+        if delivery == "local" or "," in delivery:
+            raise ValueError(
+                "deduplicate_delivery requires exactly one non-local delivery target"
+            )
+    if not str(job.get("script") or "").strip():
+        raise ValueError("deterministic script execution requires a script")
+    if str(job.get("prompt") or "").strip():
+        raise ValueError("deterministic script execution cannot include a prompt")
+    if _normalize_skill_list(job.get("skill"), job.get("skills")):
+        raise ValueError("deterministic script execution cannot include skills")
+    for field in ("model", "provider", "base_url"):
+        if job.get(field):
+            raise ValueError(f"deterministic script execution cannot include {field}")
 
 
 def _secure_dir(path: Path):
@@ -378,6 +412,9 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    execution_mode: str = "agent",
+    archive_output: bool = True,
+    deduplicate_delivery: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -397,6 +434,10 @@ def create_job(
         script: Optional path to a Python script whose stdout is injected into the
                 prompt each run.  The script runs before the agent turn, and its output
                 is prepended as context.  Useful for data collection / change detection.
+        execution_mode: ``agent`` for the existing model path or ``script`` for
+                bounded trusted-script stdout delivery without a model/session.
+        archive_output: Retain the normal per-run output artifact when true.
+        deduplicate_delivery: Script mode only; suppress stdout already delivered.
 
     Returns:
         The created job dict
@@ -439,6 +480,10 @@ def create_job(
         "provider": normalized_provider,
         "base_url": normalized_base_url,
         "script": normalized_script,
+        "execution_mode": execution_mode,
+        "archive_output": archive_output,
+        "deduplicate_delivery": deduplicate_delivery,
+        "last_delivery_key": None,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -459,6 +504,7 @@ def create_job(
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
     }
+    _validate_job_definition(job)
 
     jobs = load_jobs()
     jobs.append(job)
@@ -517,6 +563,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
+        _validate_job_definition(updated)
         jobs[i] = updated
         save_jobs(jobs)
         return _apply_skill_fields(jobs[i])
@@ -584,7 +631,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 delivered_key: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -603,9 +651,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             job["last_error"] = error if not success else None
             # Track delivery failures separately — cleared on successful delivery
             job["last_delivery_error"] = delivery_error
+            completed_successfully = success and delivery_error is None
+            if delivered_key is not None and completed_successfully:
+                job["last_delivery_key"] = delivered_key
             
             # Increment completed count
-            if job.get("repeat"):
+            count_run = completed_successfully or job.get("execution_mode", "agent") != "script"
+            if job.get("repeat") and count_run:
                 job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
                 
                 # Check if we've hit the repeat limit
