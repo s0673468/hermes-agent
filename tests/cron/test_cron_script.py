@@ -331,6 +331,30 @@ class TestDeterministicScriptJobs:
         assert final_response == ""
         assert "single-message limit" in error
 
+    def test_deterministic_job_terminates_output_above_capture_limit(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "unbounded.py"
+        script.write_text(
+            'import sys\nsys.stdout.write("x" * 200_000)\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+
+        success, _output, final_response, error = run_job(
+            {
+                "id": "unbounded",
+                "name": "unbounded",
+                "prompt": "",
+                "script": "unbounded.py",
+                "execution_mode": "script",
+            }
+        )
+
+        assert success is False
+        assert final_response == ""
+        assert "capture limit" in error
+
     def test_deterministic_job_rejects_whitespace_only_output(self, cron_env):
         from cron.scheduler import run_job
 

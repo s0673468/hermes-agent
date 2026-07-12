@@ -18,6 +18,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -504,6 +505,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
 _MAX_DETERMINISTIC_OUTPUT_UNITS = 1800
+_MAX_DETERMINISTIC_CAPTURE_BYTES = _MAX_DETERMINISTIC_OUTPUT_UNITS * 4
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
@@ -683,23 +685,79 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
     path, problem = _deterministic_script_path(script_path)
     if path is None:
         return False, problem or "Unsafe deterministic script"
+    process: subprocess.Popen[bytes] | None = None
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    overflow: list[str] = []
+    overflow_lock = threading.Lock()
+
+    def drain(stream_name: str, pipe) -> None:
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                return
+            target = buffers[stream_name]
+            remaining = _MAX_DETERMINISTIC_CAPTURE_BYTES - len(target)
+            if remaining > 0:
+                target.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                with overflow_lock:
+                    if not overflow:
+                        overflow.append(stream_name)
+                if process is not None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                return
+
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [sys.executable, str(path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=_get_script_timeout(),
             cwd=str(path.parent),
-            check=False,
         )
+        assert process.stdout is not None
+        assert process.stderr is not None
+        readers = [
+            threading.Thread(
+                target=drain,
+                args=(stream_name, pipe),
+                daemon=True,
+            )
+            for stream_name, pipe in (
+                ("stdout", process.stdout),
+                ("stderr", process.stderr),
+            )
+        ]
+        for reader in readers:
+            reader.start()
+        try:
+            process.wait(timeout=_get_script_timeout())
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            for reader in readers:
+                reader.join()
+            return False, f"Script timed out after {_get_script_timeout()}s: {path}"
+        for reader in readers:
+            reader.join()
     except subprocess.TimeoutExpired:
         return False, f"Script timed out after {_get_script_timeout()}s: {path}"
     except Exception as exc:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
         return False, f"Script execution failed: {exc}"
 
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace")
-        detail = f"Script exited with code {result.returncode}"
+    if overflow:
+        return False, (
+            f"Deterministic script {overflow[0]} exceeds the capture limit "
+            f"({_MAX_DETERMINISTIC_CAPTURE_BYTES} bytes)"
+        )
+    if process.returncode != 0:
+        stderr = bytes(buffers["stderr"]).decode("utf-8", errors="replace")
+        detail = f"Script exited with code {process.returncode}"
         if stderr:
             try:
                 from agent.redact import redact_sensitive_text
@@ -710,7 +768,7 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
             detail += f": {stderr.strip()}"
         return False, detail
     try:
-        stdout = result.stdout.decode("utf-8")
+        stdout = bytes(buffers["stdout"]).decode("utf-8")
     except UnicodeDecodeError:
         return False, "Deterministic script output is not valid UTF-8"
     if not stdout.strip():

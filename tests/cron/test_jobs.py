@@ -441,6 +441,24 @@ class TestMarkJobRun:
         assert failed["next_run_at"] is not None
         assert trigger_job(job["id"])["enabled"] is True
 
+    def test_resume_preserves_failed_one_shot_deterministic_retry(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="30m",
+            script="brief.py",
+            execution_mode="script",
+        )
+        mark_job_run(job["id"], success=False, error="script failed")
+        retry_at = get_job(job["id"])["next_run_at"]
+
+        pause_job(job["id"], reason="maintenance")
+        resumed = resume_job(job["id"])
+
+        assert retry_at is not None
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["next_run_at"] == retry_at
+
 
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""

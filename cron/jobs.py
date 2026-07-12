@@ -595,7 +595,17 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
-    next_run_at = compute_next_run(job["schedule"])
+    preserve_deterministic_retry = (
+        job.get("execution_mode", "agent") == "script"
+        and job.get("schedule", {}).get("kind") == "once"
+        and job.get("last_run_at") is not None
+        and job.get("next_run_at") is not None
+    )
+    next_run_at = (
+        job["next_run_at"]
+        if preserve_deterministic_retry
+        else compute_next_run(job["schedule"])
+    )
     return update_job(
         job_id,
         {
