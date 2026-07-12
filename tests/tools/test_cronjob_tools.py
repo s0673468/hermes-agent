@@ -1,6 +1,8 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
+import os
+import stat
 import pytest
 from pathlib import Path
 
@@ -141,6 +143,9 @@ class TestUnifiedCronjobTool:
         assert created["job"]["execution_mode"] == "script"
         assert created["job"]["archive_output"] is False
         assert created["job"]["deduplicate_delivery"] is True
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        assert stat.S_IMODE(hermes_home.stat().st_mode) == 0o700
+        assert stat.S_IMODE((hermes_home / "scripts").stat().st_mode) == 0o700
 
     def test_deterministic_script_job_rejects_prompt(self):
         result = json.loads(

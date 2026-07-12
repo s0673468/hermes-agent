@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -150,7 +151,31 @@ def _normalize_optional_job_value(value: Optional[Any], *, strip_trailing_slash:
     return text or None
 
 
-def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
+def _secure_deterministic_script_dirs(scripts_dir: Path) -> Optional[str]:
+    """Create and tighten deterministic-script directories to owner-only."""
+    hermes_home = scripts_dir.parent
+    try:
+        scripts_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        current_uid = os.getuid() if hasattr(os, "getuid") else None
+        for path, label in (
+            (hermes_home, "HERMES_HOME"),
+            (scripts_dir, "deterministic scripts directory"),
+        ):
+            metadata = path.lstat()
+            if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                return f"{label} must be a real directory"
+            if current_uid is not None and metadata.st_uid != current_uid:
+                return f"{label} must be owned by the current user"
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                path.chmod(0o700)
+    except OSError as exc:
+        return f"Could not secure deterministic script directories: {exc}"
+    return None
+
+
+def _validate_cron_script_path(
+    script: Optional[str], *, owner_only: bool = False
+) -> Optional[str]:
     """Validate a cron job script path at the API boundary.
 
     Scripts must be relative paths that resolve within HERMES_HOME/scripts/.
@@ -179,7 +204,12 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     from tools.path_security import validate_within_dir
 
     scripts_dir = get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
+    if owner_only:
+        security_error = _secure_deterministic_script_dirs(scripts_dir)
+        if security_error:
+            return security_error
+    else:
+        scripts_dir.mkdir(parents=True, exist_ok=True)
     containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
     if containment_error:
         return (
@@ -262,7 +292,9 @@ def cronjob(
 
             # Validate script path before storing
             if script:
-                script_error = _validate_cron_script_path(script)
+                script_error = _validate_cron_script_path(
+                    script, owner_only=requested_mode == "script"
+                )
                 if script_error:
                     return tool_error(script_error, success=False)
 
@@ -346,6 +378,7 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            final_mode = execution_mode or job.get("execution_mode", "agent")
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -367,10 +400,6 @@ def cronjob(
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
             if script is not None:
                 # Pass empty string to clear an existing script
-                if script:
-                    script_error = _validate_cron_script_path(script)
-                    if script_error:
-                        return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
             if execution_mode is not None:
                 updates["execution_mode"] = execution_mode
@@ -378,6 +407,15 @@ def cronjob(
                 updates["archive_output"] = archive_output
             if deduplicate_delivery is not None:
                 updates["deduplicate_delivery"] = deduplicate_delivery
+            final_script = (
+                updates.get("script") if script is not None else job.get("script")
+            )
+            if final_script:
+                script_error = _validate_cron_script_path(
+                    str(final_script), owner_only=final_mode == "script"
+                )
+                if script_error:
+                    return tool_error(script_error, success=False)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
