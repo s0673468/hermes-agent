@@ -283,6 +283,33 @@ class TestDeterministicScriptJobs:
         assert final_response == ""
         assert "code 7" in error
 
+    def test_deterministic_job_ignores_non_utf8_stderr_on_success(self, cron_env):
+        from cron.scheduler import run_job
+
+        script = cron_env / "scripts" / "stderr_bytes.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.write('health brief\\n')\n"
+            "sys.stderr.buffer.write(b'\\xff')\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+
+        success, output, final_response, error = run_job(
+            {
+                "id": "stderr-bytes",
+                "name": "stderr-bytes",
+                "prompt": "",
+                "script": "stderr_bytes.py",
+                "execution_mode": "script",
+            }
+        )
+
+        assert success is True
+        assert output == "health brief\n"
+        assert final_response == output
+        assert error is None
+
     def test_deterministic_job_rejects_oversized_output(self, cron_env):
         from cron.scheduler import run_job
 

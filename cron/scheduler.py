@@ -697,12 +697,8 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
-    try:
-        stdout = result.stdout.decode("utf-8")
-        stderr = result.stderr.decode("utf-8")
-    except UnicodeDecodeError:
-        return False, "Deterministic script output is not valid UTF-8"
     if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
         detail = f"Script exited with code {result.returncode}"
         if stderr:
             try:
@@ -713,6 +709,10 @@ def _run_deterministic_script(script_path: str) -> tuple[bool, str]:
                 pass
             detail += f": {stderr.strip()}"
         return False, detail
+    try:
+        stdout = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "Deterministic script output is not valid UTF-8"
     if not stdout.strip():
         return False, "Deterministic script produced empty output"
     output_units = len(stdout.encode("utf-16-le")) // 2
