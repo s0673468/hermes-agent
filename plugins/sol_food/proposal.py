@@ -211,6 +211,11 @@ class FoodProposal:
     # Set after a confirmed Health commit: opaque receipt reference
     # (value-free — a hash/id, never food content).
     receipt_ref: Optional[str] = None
+    # True from the moment the Confirm token is durably consumed until the
+    # verified Health receipt is recorded. While set, the proposal must
+    # NOT expire or be treated as re-confirmable: the frozen envelope +
+    # reconcile() own completion.
+    awaiting_commit: bool = False
 
     # ── serialization ───────────────────────────────────────────────────
     def to_json(self) -> Dict[str, Any]:
@@ -230,6 +235,7 @@ class FoodProposal:
             "presentation_message_id": self.presentation_message_id,
             "tokens": self.tokens,
             "receipt_ref": self.receipt_ref,
+            "awaiting_commit": self.awaiting_commit,
         }
 
     @classmethod
@@ -262,6 +268,7 @@ class FoodProposal:
             receipt_ref=(
                 str(data["receipt_ref"]) if data.get("receipt_ref") is not None else None
             ),
+            awaiting_commit=bool(data.get("awaiting_commit", False)),
         )
 
     # ── lifecycle helpers (invoked by the store under its lock) ─────────

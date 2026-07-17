@@ -172,6 +172,11 @@ class FoodProposalStore:
     def _sweep_locked(self, now: float) -> bool:
         changed = False
         for proposal in list(self._proposals.values()):
+            if proposal.awaiting_commit:
+                # A durably consumed Confirm owns this proposal until its
+                # verified receipt lands: it must never expire out from
+                # under the frozen envelope / reconcile().
+                continue
             if proposal.state is ProposalState.PENDING and proposal.expired(now):
                 proposal.state = ProposalState.EXPIRED
                 proposal.invalidate_all_tokens()
@@ -284,6 +289,106 @@ class FoodProposalStore:
             self._persist()
             return proposal, tokens
 
+    def _validate_callback_locked(
+        self,
+        *,
+        token: str,
+        update_id: int,
+        bot_id: str,
+        chat_id: str,
+        thread_id: Optional[int],
+        callback_message_id: Optional[int],
+        now: float,
+        mutate_expiry: bool,
+    ):
+        """Shared validation. Returns either a terminal CallbackOutcome
+        (replay/denied) or the ``(proposal, record, action)`` triple that a
+        consumer may act on. Mutates nothing except (optionally) the
+        expiry transition when ``mutate_expiry`` is set."""
+        update_key = str(update_id)
+        prior = self._consumed_updates.get(update_key)
+        if prior is not None:
+            return CallbackOutcome.replay(prior.get("receipt_ref"))
+
+        record = None
+        proposal = None
+        for candidate_proposal in self._proposals.values():
+            if token in candidate_proposal.tokens:
+                proposal = candidate_proposal
+                record = candidate_proposal.tokens[token]
+                break
+        if proposal is None or record is None:
+            return CallbackOutcome.denied(REASON_UNKNOWN_TOKEN)
+
+        # Origin binding: owner chat, thread, bot, presentation message.
+        if (
+            str(chat_id) != proposal.owner_chat_id
+            or str(bot_id) != proposal.bot_id
+            or thread_id is None
+            or int(thread_id) != proposal.thread_id
+        ):
+            return CallbackOutcome.denied(REASON_FOREIGN_ORIGIN)
+        if (
+            proposal.presentation_message_id is not None
+            and callback_message_id is not None
+            and int(callback_message_id) != proposal.presentation_message_id
+        ):
+            return CallbackOutcome.denied(REASON_BAD_PRESENTATION)
+
+        if proposal.state is not ProposalState.PENDING:
+            if proposal.state is ProposalState.EXPIRED:
+                return CallbackOutcome.denied(REASON_EXPIRED)
+            return CallbackOutcome.denied(REASON_ALREADY_RESOLVED)
+        if proposal.expired(now):
+            if mutate_expiry:
+                proposal.state = ProposalState.EXPIRED
+                proposal.invalidate_all_tokens()
+                proposal.scrub_content()
+                self._persist()
+            return CallbackOutcome.denied(REASON_EXPIRED)
+        if int(record.get("version", -1)) != proposal.version:
+            return CallbackOutcome.denied(REASON_STALE_VERSION)
+        if record.get("consumed"):
+            return CallbackOutcome.denied(REASON_ALREADY_RESOLVED)
+        return proposal, record, str(record.get("action"))
+
+    async def peek_callback(
+        self,
+        *,
+        token: str,
+        update_id: int,
+        bot_id: str,
+        chat_id: str,
+        thread_id: Optional[int],
+        callback_message_id: Optional[int],
+    ) -> CallbackOutcome:
+        """Validate WITHOUT consuming. Same outcome kinds as
+        ``resolve_callback``, but nothing is mutated or persisted.
+
+        Callers use this to prepare durable side-effect state (e.g. freeze
+        a commit envelope) BEFORE the atomic consume, so a crash between
+        the two can always be reconciled. A peek result is advisory: the
+        authoritative decision is the subsequent ``resolve_callback``.
+        """
+        async with self._lock:
+            now = self._clock()
+            if self._sweep_locked(now):
+                self._persist()
+            result = self._validate_callback_locked(
+                token=token,
+                update_id=update_id,
+                bot_id=bot_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                callback_message_id=callback_message_id,
+                now=now,
+                mutate_expiry=False,
+            )
+            if isinstance(result, CallbackOutcome):
+                return result
+            proposal, _record, action = result
+            return CallbackOutcome.act(action, proposal.proposal_id)
+
     async def resolve_callback(
         self,
         *,
@@ -300,7 +405,9 @@ class FoodProposalStore:
         - exact-duplicate update replay is detected FIRST and returns the
           original receipt reference with no state change;
         - all origin/version/expiry validation happens BEFORE consumption;
-        - consumption + update-dedup are persisted in one atomic write
+        - consumption + update-dedup (and, for Confirm, the durable
+          ``awaiting_commit`` flag that pins the proposal until its
+          verified receipt lands) are persisted in ONE atomic write
           BEFORE the outcome is returned (so the caller's side effect can
           never run twice, even across a crash+restart).
         """
@@ -308,59 +415,33 @@ class FoodProposalStore:
             now = self._clock()
             if self._sweep_locked(now):
                 self._persist()
-            update_key = str(update_id)
-            prior = self._consumed_updates.get(update_key)
-            if prior is not None:
-                return CallbackOutcome.replay(prior.get("receipt_ref"))
+            result = self._validate_callback_locked(
+                token=token,
+                update_id=update_id,
+                bot_id=bot_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                callback_message_id=callback_message_id,
+                now=now,
+                mutate_expiry=True,
+            )
+            if isinstance(result, CallbackOutcome):
+                return result
+            proposal, record, action = result
 
-            record = None
-            proposal = None
-            for candidate_proposal in self._proposals.values():
-                if token in candidate_proposal.tokens:
-                    proposal = candidate_proposal
-                    record = candidate_proposal.tokens[token]
-                    break
-            if proposal is None or record is None:
-                return CallbackOutcome.denied(REASON_UNKNOWN_TOKEN)
-
-            # Origin binding: owner chat, thread, bot, presentation message.
-            if (
-                str(chat_id) != proposal.owner_chat_id
-                or str(bot_id) != proposal.bot_id
-                or thread_id is None
-                or int(thread_id) != proposal.thread_id
-            ):
-                return CallbackOutcome.denied(REASON_FOREIGN_ORIGIN)
-            if (
-                proposal.presentation_message_id is not None
-                and callback_message_id is not None
-                and int(callback_message_id) != proposal.presentation_message_id
-            ):
-                return CallbackOutcome.denied(REASON_BAD_PRESENTATION)
-
-            if proposal.state is not ProposalState.PENDING:
-                if proposal.state is ProposalState.EXPIRED:
-                    return CallbackOutcome.denied(REASON_EXPIRED)
-                return CallbackOutcome.denied(REASON_ALREADY_RESOLVED)
-            if proposal.expired(now):
-                proposal.state = ProposalState.EXPIRED
-                proposal.invalidate_all_tokens()
-                proposal.scrub_content()
-                self._persist()
-                return CallbackOutcome.denied(REASON_EXPIRED)
-            if int(record.get("version", -1)) != proposal.version:
-                return CallbackOutcome.denied(REASON_STALE_VERSION)
-            if record.get("consumed"):
-                return CallbackOutcome.denied(REASON_ALREADY_RESOLVED)
-
-            action = str(record.get("action"))
             # Atomic consume + dedup, durably, before any side effect.
             record["consumed"] = True
             if action == ACTION_CONFIRM:
                 # Confirm freezes the whole proposal against further
-                # actions; other tokens die with it.
+                # actions; other tokens die with it. Only a COMMITTABLE
+                # confirm (exactly one candidate) pins the proposal
+                # (no expiry) until the verified receipt lands — a
+                # multi-candidate confirm is answered with "select
+                # first" and never commits.
                 proposal.invalidate_all_tokens()
-            self._consumed_updates[update_key] = {
+                if len(proposal.candidates) == 1:
+                    proposal.awaiting_commit = True
+            self._consumed_updates[str(update_id)] = {
                 "ts": now,
                 "receipt_ref": None,
                 "proposal_id": proposal.proposal_id,
@@ -380,6 +461,7 @@ class FoodProposalStore:
                 raise ProposalError(REASON_UNKNOWN_TOKEN)
             proposal.state = ProposalState.CONFIRMED
             proposal.receipt_ref = str(receipt_ref)
+            proposal.awaiting_commit = False
             proposal.scrub_content()
             entry = self._consumed_updates.get(str(update_id))
             if entry is not None:
@@ -396,6 +478,7 @@ class FoodProposalStore:
             if proposal is None:
                 raise ProposalError(REASON_UNKNOWN_TOKEN)
             proposal.state = state
+            proposal.awaiting_commit = False
             proposal.invalidate_all_tokens()
             proposal.scrub_content()
             self._persist()

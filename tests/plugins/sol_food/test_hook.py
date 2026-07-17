@@ -19,7 +19,8 @@ from plugins.sol_food.limits import (
     FOOD_PARSE_DEADLINE_SECONDS,
     FOOD_TEXT_MAX_CHARS,
 )
-from plugins.sol_food.proposal import ACTION_CANCEL, ACTION_CONFIRM, Candidate
+from plugins.sol_food.proposal import ACTION_CANCEL, ACTION_CONFIRM, Candidate, ProposalState
+from plugins.sol_food.store import CallbackOutcome
 
 SOL = TopicRoute("208214988", 1, "sol")
 
@@ -440,3 +441,211 @@ class TestFrozenRetry:
         count = await reborn.reconcile()
         assert count == 1
         assert health.calls[-1] == first_bytes
+
+
+class TestCrashWindows:
+    """P2 regression: a crash anywhere after user-Confirm either completes
+    via reconcile() or restores the proposal to confirmable."""
+
+    async def _prep_single_candidate(self, hook):
+        replies = Replies()
+        proposal_id = await hook.propose_from_text(origin(), "synthetic meal", replies)
+        assert proposal_id is not None
+        proposal = await hook._store.get(proposal_id)
+        tokens = {r["action"]: t for t, r in proposal.tokens.items()}
+        await hook.on_callback(SOL, origin(update_id=4000), tokens["choice:0"], replies)
+        proposal = await hook._store.get(proposal_id)
+        tokens = {
+            r["action"]: t for t, r in proposal.tokens.items() if not r["consumed"]
+        }
+        return proposal_id, tokens, replies
+
+    @pytest.mark.asyncio
+    async def test_crash_between_freeze_and_consume_restores_confirmable(
+        self, tmp_path, clock, health
+    ):
+        hook = SolFoodHook(
+            state_dir=tmp_path / "cw1",
+            hermes_home=tmp_path / "cw1h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        proposal_id, tokens, replies = await self._prep_single_candidate(hook)
+        confirm_token = tokens[ACTION_CONFIRM]
+
+        # Crash injected AFTER peek+freeze, BEFORE the durable consume.
+        async def crash(**kwargs):
+            raise RuntimeError("simulated crash")
+
+        hook._store.resolve_callback = crash
+        with pytest.raises(RuntimeError):
+            await hook.on_callback(
+                SOL, origin(update_id=4001), confirm_token, replies
+            )
+        # Envelope was frozen pre-consume; token was never consumed.
+        assert hook._envelopes.pending_ids() == [proposal_id]
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.awaiting_commit is False
+
+        # Restart: reconcile discards the unsent envelope (these bytes
+        # never left the process) and the proposal stays confirmable.
+        reborn = SolFoodHook(
+            state_dir=tmp_path / "cw1",
+            hermes_home=tmp_path / "cw1h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        assert await reborn.reconcile() == 0
+        assert health.calls == []
+        assert reborn._envelopes.pending_ids() == []
+
+        # A fresh Confirm tap now completes exactly once.
+        decision = await reborn.on_callback(
+            SOL, origin(update_id=4002), confirm_token, replies
+        )
+        assert decision is HookDecision.CONSUME
+        assert len(health.calls) == 1
+        proposal = await reborn._store.get(proposal_id)
+        assert proposal.state.value == "confirmed"
+
+    @pytest.mark.asyncio
+    async def test_crash_between_consume_and_send_completes_via_reconcile(
+        self, tmp_path, clock, health
+    ):
+        hook = SolFoodHook(
+            state_dir=tmp_path / "cw2",
+            hermes_home=tmp_path / "cw2h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        proposal_id, tokens, replies = await self._prep_single_candidate(hook)
+        confirm_token = tokens[ACTION_CONFIRM]
+
+        # Crash injected AFTER the durable consume, BEFORE any send.
+        async def crash_send(*args, **kwargs):
+            raise RuntimeError("simulated crash")
+
+        hook._send_frozen = crash_send
+        with pytest.raises(RuntimeError):
+            await hook.on_callback(
+                SOL, origin(update_id=4101), confirm_token, replies
+            )
+        assert health.calls == []
+        # The consume is durable and the envelope is frozen.
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.awaiting_commit is True
+        frozen, frozen_update = hook._envelopes.load(proposal_id)
+
+        # Restart: reconcile completes EXACTLY once with the exact bytes.
+        reborn = SolFoodHook(
+            state_dir=tmp_path / "cw2",
+            hermes_home=tmp_path / "cw2h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        assert await reborn.reconcile() == 1
+        assert len(health.calls) == 1
+        assert health.calls[0] == frozen.request_bytes
+        proposal = await reborn._store.get(proposal_id)
+        assert proposal.state.value == "confirmed"
+        assert proposal.receipt_ref is not None
+        assert reborn._envelopes.pending_ids() == []
+
+        # Duplicate delivery of the consumed update replays; a new tap on
+        # the consumed token denies. Neither commits again.
+        await reborn.on_callback(SOL, origin(update_id=4101), confirm_token, replies)
+        await reborn.on_callback(SOL, origin(update_id=4102), confirm_token, replies)
+        assert len(health.calls) == 1
+        assert await reborn.reconcile() == 0
+        assert len(health.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_awaiting_commit_survives_ttl(self, tmp_path, clock, health):
+        from plugins.sol_food.limits import FOOD_PROPOSAL_TTL_SECONDS
+
+        hook = SolFoodHook(
+            state_dir=tmp_path / "cw3",
+            hermes_home=tmp_path / "cw3h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        proposal_id, tokens, replies = await self._prep_single_candidate(hook)
+        health.error = HealthClientError(
+            "health_client_transport_error", retryable=True
+        )
+        await hook.on_callback(
+            SOL, origin(update_id=4200), tokens[ACTION_CONFIRM], replies
+        )
+        assert len(health.calls) == 1
+
+        # Far past the proposal TTL: a consumed Confirm never expires out
+        # from under its frozen envelope.
+        clock.now += FOOD_PROPOSAL_TTL_SECONDS + 100
+        health.error = None
+        health.replayed = True
+        assert await hook.reconcile() == 1
+        assert len(health.calls) == 2
+        assert health.calls[1] == health.calls[0]
+
+    @pytest.mark.asyncio
+    async def test_cancel_race_discards_prefrozen_envelope(
+        self, tmp_path, clock, health
+    ):
+        # A Cancel that wins the race against Confirm must not leave a
+        # frozen envelope behind for reconcile() to commit.
+        hook = SolFoodHook(
+            state_dir=tmp_path / "cw4",
+            hermes_home=tmp_path / "cw4h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        proposal_id, tokens, replies = await self._prep_single_candidate(hook)
+        confirm_token = tokens[ACTION_CONFIRM]
+        cancel_token = tokens[ACTION_CANCEL]
+
+        # Interleave: the Cancel consumes between our peek/freeze and our
+        # consume. Simulate by wrapping resolve_callback to first run the
+        # cancel flow, then the original resolution.
+        original_resolve = hook._store.resolve_callback
+        state = {"interleaved": False}
+
+        async def interleaving_resolve(**kwargs):
+            if not state["interleaved"]:
+                state["interleaved"] = True
+                cancel_outcome = await original_resolve(
+                    token=cancel_token,
+                    update_id=4301,
+                    bot_id=kwargs["bot_id"],
+                    chat_id=kwargs["chat_id"],
+                    thread_id=kwargs["thread_id"],
+                    callback_message_id=kwargs["callback_message_id"],
+                )
+                assert cancel_outcome.kind == CallbackOutcome.KIND_ACTION
+                await hook._store.mark_terminal(
+                    proposal_id, ProposalState.CANCELLED
+                )
+            return await original_resolve(**kwargs)
+
+        hook._store.resolve_callback = interleaving_resolve
+        decision = await hook.on_callback(
+            SOL, origin(update_id=4300), confirm_token, replies
+        )
+        assert decision is HookDecision.CONSUME
+        assert health.calls == []
+        # The pre-frozen envelope was discarded; restart commits nothing.
+        assert hook._envelopes.pending_ids() == []
+        reborn = SolFoodHook(
+            state_dir=tmp_path / "cw4",
+            hermes_home=tmp_path / "cw4h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        assert await reborn.reconcile() == 0
+        assert health.calls == []

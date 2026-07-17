@@ -174,6 +174,10 @@ class SolFoodHook(TopicPluginHook):
     ) -> None:
         # Single-writer guard: refuse to exist while the legacy
         # append-style helper is present (raises LegacyHelperPresent).
+        # Caller contract: ``hermes_home`` MUST be the ACTIVE profile's
+        # Hermes home (the directory the running gateway resolves) — the
+        # guard inspects exactly that tree, so pointing it anywhere else
+        # would void the single-writer property.
         assert_legacy_helper_disabled(hermes_home)
         self._store = FoodProposalStore(Path(state_dir), clock=clock)
         self._cache = FoodImageCache(Path(state_dir))
@@ -377,7 +381,7 @@ class SolFoodHook(TopicPluginHook):
         if token is None:
             logger.info("[sol-food] food_callback_malformed")
             return HookDecision.DENY
-        outcome = await self._store.resolve_callback(
+        callback_identity = dict(
             token=token,
             update_id=origin.update_id,
             bot_id=origin.bot_id,
@@ -385,12 +389,31 @@ class SolFoodHook(TopicPluginHook):
             thread_id=origin.thread_id,
             callback_message_id=origin.message_id,
         )
+        # Crash-safety ordering: if this callback would consume a Confirm,
+        # FREEZE the commit envelope durably BEFORE the token is consumed.
+        # A crash between freeze and consume discards the unsent envelope
+        # (proposal stays confirmable); a crash after consume always
+        # completes via reconcile() with the exact frozen bytes. The peek
+        # is advisory only — resolve_callback stays the authority.
+        pre_froze_pid = None
+        peek = await self._store.peek_callback(**callback_identity)
+        if (
+            peek.kind == CallbackOutcome.KIND_ACTION
+            and peek.action == ACTION_CONFIRM
+            and peek.proposal_id is not None
+        ):
+            pre_froze_pid = await self._prefreeze_confirm_envelope(
+                peek.proposal_id, origin.update_id
+            )
+        outcome = await self._store.resolve_callback(**callback_identity)
         if outcome.kind == CallbackOutcome.KIND_REPLAY:
             # Exact transport replay: original effect stands; surface the
             # original acknowledgement, no second effect.
             await reply(_MSG_RESOLVED)
             return HookDecision.CONSUME
         if outcome.kind == CallbackOutcome.KIND_DENIED:
+            if pre_froze_pid is not None:
+                await self._discard_stale_envelope(pre_froze_pid)
             logger.info("[sol-food] %s", outcome.reason_code)
             await reply(self._denial_message(outcome.reason_code))
             return HookDecision.CONSUME
@@ -409,6 +432,39 @@ class SolFoodHook(TopicPluginHook):
         }
         return mapping.get(reason_code or "", _MSG_DENIED)
 
+    async def _prefreeze_confirm_envelope(
+        self, proposal_id: str, update_id: int
+    ) -> Optional[str]:
+        """Durably freeze (fsync) the commit envelope for a confirmable
+        single-candidate proposal. Returns the proposal id when an
+        envelope is (now) frozen, else None. Reuses an already-frozen
+        envelope byte-for-byte (mutation identity never changes)."""
+        proposal = await self._store.get(proposal_id)
+        if proposal is None or proposal.state is not ProposalState.PENDING:
+            return None
+        if len(proposal.candidates) != 1:
+            return None
+        if self._envelopes.load(proposal_id) is None:
+            envelope = build_commit_envelope(
+                operation="create",
+                occurred_at=_occurred_at_now(self._clock),
+                items=[dict(i) for i in proposal.candidates[0].items],
+                expected_revision=0,
+            )
+            self._envelopes.save(proposal_id, envelope, update_id)
+        return proposal_id
+
+    async def _discard_stale_envelope(self, proposal_id: str) -> None:
+        """Drop a pre-frozen envelope whose Confirm never (durably)
+        consumed — e.g. an interleaved Cancel won the race. Never drops
+        an envelope owned by a consumed Confirm awaiting its receipt."""
+        proposal = await self._store.get(proposal_id)
+        if proposal is None:
+            return
+        if proposal.awaiting_commit or proposal.state is ProposalState.CONFIRMED:
+            return
+        self._envelopes.delete(proposal_id)
+
     async def _perform_action(
         self,
         action: str,
@@ -418,6 +474,7 @@ class SolFoodHook(TopicPluginHook):
     ) -> None:
         if action == ACTION_CANCEL:
             await self._store.mark_terminal(proposal_id, ProposalState.CANCELLED)
+            self._envelopes.delete(proposal_id)
             self._drop_image(proposal_id)
             await reply(_MSG_CANCELLED)
             return
@@ -517,6 +574,22 @@ class SolFoodHook(TopicPluginHook):
             if loaded is None:
                 self._envelopes.delete(proposal_id)
                 continue
+            proposal = await self._store.get(proposal_id)
+            if proposal is not None:
+                if proposal.state in (ProposalState.CANCELLED, ProposalState.EXPIRED):
+                    # A terminal non-confirmed proposal owns no commit.
+                    self._envelopes.delete(proposal_id)
+                    continue
+                if (
+                    proposal.state is ProposalState.PENDING
+                    and not proposal.awaiting_commit
+                ):
+                    # Crash between freeze and consume: the Confirm never
+                    # durably consumed and these bytes were never sent.
+                    # Restore-to-confirmable — discard; a fresh Confirm
+                    # freezes a new envelope.
+                    self._envelopes.delete(proposal_id)
+                    continue
             envelope, update_id = loaded
             try:
                 verified = await asyncio.get_running_loop().run_in_executor(
@@ -525,9 +598,15 @@ class SolFoodHook(TopicPluginHook):
             except HealthClientError as err:
                 logger.info("[sol-food] %s", err.reason_code)
                 continue
-            await self._store.record_receipt(
-                proposal_id, update_id, verified.receipt_sha256
-            )
+            try:
+                await self._store.record_receipt(
+                    proposal_id, update_id, verified.receipt_sha256
+                )
+            except ProposalError:
+                # Orphaned envelope (proposal pruned): the canonical commit
+                # verified; nothing transport-side is left to bind. Do not
+                # abort the loop for the remaining envelopes.
+                logger.info("[sol-food] sol_food_reconcile_orphan")
             self._envelopes.delete(proposal_id)
             verified_count += 1
             if reply is not None:
