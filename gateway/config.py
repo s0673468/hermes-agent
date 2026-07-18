@@ -972,6 +972,10 @@ class GatewayConfig:
                 "Telegram cannot combine topic_routing and private_chat_routing"
             )
         if isinstance(private_chat_routing, dict) and private_chat_routing:
+            if telegram is not None and telegram.extra.get("dm_topics"):
+                raise ValueError(
+                    "Telegram private_chat_routing cannot combine with dm_topics"
+                )
             from gateway.private_chat_routing import PrivateChatRouteRegistry
 
             PrivateChatRouteRegistry.from_config(private_chat_routing)

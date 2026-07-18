@@ -732,6 +732,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 "Telegram gateway cannot enable topic_routing and "
                 "private_chat_routing together"
             )
+        if _private_routing_cfg and self.config.extra.get("dm_topics"):
+            raise ValueError(
+                "Telegram private_chat_routing cannot combine with dm_topics"
+            )
         if _topic_routing_cfg:
             if str(_topic_routing_cfg.get("mode", "")) != "strict":
                 raise ValueError("topic_routing.mode must be 'strict'")
@@ -1126,15 +1130,15 @@ class TelegramAdapter(BasePlatformAdapter):
     def _strict_route_thread_key(self, msg: Any) -> Any:
         """Return the mode-appropriate inbound thread key.
 
-        Forum routing retains its established normalization.  A dedicated
-        private bot rejects any raw ``message_thread_id`` even when Telegram
-        does not set ``is_topic_message``; accepting that inconsistent update
-        would let it reach session/media/command setup as an unthreaded DM.
+        Forum routing and private routing both use Telegram's semantic topic
+        marker. Plain private-chat replies can carry a raw
+        ``message_thread_id`` as a reply-UI anchor; the shared normalizer drops
+        that anchor while retaining genuine topic messages for fail-closed
+        private-route rejection.
         """
 
         if getattr(self, "_private_chat_route_registry", None) is not None:
-            thread_id = getattr(msg, "message_thread_id", None)
-            return str(thread_id) if thread_id is not None else None
+            return self._effective_message_thread_id(msg)
         return self._strict_thread_key(msg)
 
     @classmethod
@@ -1341,6 +1345,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # topic during send remains forbidden.
         if metadata and metadata.get("telegram_dm_topic_created_for_send"):
             return "topic_route_send_fallback_denied"
+        if (
+            registry is getattr(self, "_private_chat_route_registry", None)
+            and self._metadata_direct_messages_topic_id(metadata) is not None
+        ):
+            return "private_route_unexpected_thread"
         try:
             if registry is getattr(self, "_private_chat_route_registry", None):
                 registry.resolve_destination(chat_id=chat_id, thread_id=thread_id)

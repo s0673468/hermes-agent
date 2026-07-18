@@ -107,6 +107,28 @@ def test_gateway_config_accepts_one_dedicated_private_route():
     ] == "atlas"
 
 
+def test_gateway_config_rejects_private_route_with_dm_topics():
+    from gateway.config import GatewayConfig
+
+    with pytest.raises(ValueError, match="cannot combine with dm_topics"):
+        GatewayConfig.from_dict(
+            {
+                "platforms": {
+                    "telegram": {
+                        "enabled": True,
+                        "token": "synthetic-test-token",
+                        "extra": {
+                            "private_chat_routing": config(),
+                            "dm_topics": [
+                                {"chat_id": 208214988, "topics": [{"name": "Old"}]}
+                            ],
+                        },
+                    }
+                }
+            }
+        )
+
+
 def test_gateway_config_rejects_private_and_topic_modes_together():
     from gateway.config import GatewayConfig
 

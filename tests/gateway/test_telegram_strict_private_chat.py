@@ -62,13 +62,20 @@ def make_adapter():
     return adapter
 
 
-def message(*, chat_id=OWNER_ID, user_id=OWNER_ID, chat_type="private", thread=None):
+def message(
+    *,
+    chat_id=OWNER_ID,
+    user_id=OWNER_ID,
+    chat_type="private",
+    thread=None,
+    is_topic_message=False,
+):
     return SimpleNamespace(
         chat=SimpleNamespace(id=chat_id, type=chat_type, is_forum=False),
         chat_id=chat_id,
         from_user=SimpleNamespace(id=user_id, first_name="Owner"),
         message_thread_id=thread,
-        is_topic_message=False,
+        is_topic_message=is_topic_message,
         message_id=42,
         text="hello",
         caption=None,
@@ -105,7 +112,7 @@ async def test_owner_text_routes_to_atlas_without_thread():
         message(chat_id=999),
         message(user_id=999),
         message(chat_type="group"),
-        message(thread=1),
+        message(thread=1, is_topic_message=True),
     ],
 )
 async def test_foreign_group_or_threaded_text_has_zero_pipeline_effect(msg):
@@ -113,6 +120,18 @@ async def test_foreign_group_or_threaded_text_has_zero_pipeline_effect(msg):
     adapter._is_user_authorized_from_message = lambda incoming: True
     adapter._should_process_message = MagicMock(return_value=True)
     await adapter._handle_text_message(update(msg), None)
+    adapter._should_process_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_plain_private_reply_anchor_routes_as_unthreaded_owner_message():
+    adapter = make_adapter()
+    hook = AtlasHook(HookDecision.CONSUME)
+    adapter.register_conversation_hook(hook)
+    adapter._is_user_authorized_from_message = lambda incoming: True
+    adapter._should_process_message = MagicMock(return_value=True)
+    await adapter._handle_text_message(update(message(thread=777)), None)
+    assert hook.calls == [("message", "atlas", None)]
     adapter._should_process_message.assert_not_called()
 
 
@@ -155,6 +174,19 @@ async def test_origin_reply_never_sends_message_thread_id():
     await adapter._origin_reply(origin)("ok")
     kwargs = adapter._bot.send_message.await_args.kwargs
     assert kwargs == {"chat_id": str(OWNER_ID), "text": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_private_send_rejects_direct_message_topic_metadata():
+    adapter = make_adapter()
+    result = await adapter.send(
+        str(OWNER_ID),
+        "hello",
+        metadata={"direct_messages_topic_id": "777"},
+    )
+    assert result.success is False
+    assert result.error == "private_route_unexpected_thread"
+    adapter._bot.send_message.assert_not_awaited()
 
 
 def test_swapped_token_is_rejected_before_polling_start():
