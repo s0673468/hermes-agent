@@ -9596,6 +9596,19 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
         )
+        private_registry = getattr(self, "_private_chat_route_registry", None)
+        if private_registry is not None:
+            # Re-resolve at the event-construction boundary and stamp the
+            # admitted route's profile before session-key or runtime-home
+            # selection. A copied/wrong active HERMES_HOME therefore cannot
+            # silently turn an ATLAS update into a default or METIS turn.
+            private_route = private_registry.resolve(
+                chat_id=chat.id,
+                chat_type=telegram_chat_type,
+                user_id=user.id if user else None,
+                thread_id=thread_id_str,
+            )
+            source.profile = private_route.profile
         
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageType
 from gateway.private_chat_routing import PrivateChatRouteRegistry
 from gateway.topic_hooks import HookDecision, TopicHookRegistry, TopicPluginHook
 
@@ -71,9 +72,20 @@ def message(
     is_topic_message=False,
 ):
     return SimpleNamespace(
-        chat=SimpleNamespace(id=chat_id, type=chat_type, is_forum=False),
+        chat=SimpleNamespace(
+            id=chat_id,
+            type=chat_type,
+            is_forum=False,
+            title=None,
+            full_name="Owner",
+        ),
         chat_id=chat_id,
-        from_user=SimpleNamespace(id=user_id, first_name="Owner"),
+        from_user=SimpleNamespace(
+            id=user_id,
+            first_name="Owner",
+            full_name="Owner",
+            is_bot=False,
+        ),
         message_thread_id=thread,
         is_topic_message=is_topic_message,
         message_id=42,
@@ -86,6 +98,9 @@ def message(
         audio=None,
         document=None,
         media_group_id=None,
+        reply_to_message=None,
+        quote=None,
+        date=None,
     )
 
 
@@ -133,6 +148,12 @@ async def test_plain_private_reply_anchor_routes_as_unthreaded_owner_message():
     await adapter._handle_text_message(update(message(thread=777)), None)
     assert hook.calls == [("message", "atlas", None)]
     adapter._should_process_message.assert_not_called()
+
+
+def test_private_event_is_stamped_with_admitted_route_profile():
+    adapter = make_adapter()
+    event = adapter._build_message_event(message(), MessageType.TEXT, update_id=500)
+    assert event.source.profile == "atlas"
 
 
 @pytest.mark.asyncio
