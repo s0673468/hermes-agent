@@ -7,6 +7,7 @@ import json
 import stat
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -213,6 +214,29 @@ class TestTextProposal:
         proposal_id = await hook.propose_from_text(origin(), "synthetic meal", replies)
         assert proposal_id is not None
         assert health.calls == []  # candidates never write
+
+    @pytest.mark.asyncio
+    async def test_active_proposal_edit_enforces_text_length_before_parser(self, hook):
+        replies = Replies()
+        proposal_id = await hook.propose_from_text(
+            origin(), "synthetic meal", replies
+        )
+        assert proposal_id is not None
+        parser = AsyncMock(return_value=sample_candidates())
+        hook._parser = parser
+
+        decision = await hook.on_message(
+            SOL,
+            origin(update_id=1001),
+            "/food " + "x" * (FOOD_TEXT_MAX_CHARS + 1),
+            replies,
+        )
+
+        assert decision is HookDecision.CONSUME
+        parser.assert_not_awaited()
+        assert replies.messages[-1] == (
+            "That description is too long to log — please shorten it."
+        )
 
     @pytest.mark.asyncio
     async def test_origin_presenter_binds_opaque_buttons_before_callback(self, hook):

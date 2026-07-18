@@ -1208,16 +1208,18 @@ class TelegramAdapter(BasePlatformAdapter):
         """Outbound gate for strict mode. Returns a stable error string
         when the send must be refused, else None.
 
-        Refuses (a) any DM-topic fallback/creation marker — no send may
-        fall back outside its registered thread — and (b) any
-        destination that does not resolve to a registered route."""
+        Refuses (a) topic creation during send and (b) any destination that
+        does not resolve to a registered route.  The legacy-named reply marker
+        is allowed only because exact registry resolution remains authoritative;
+        strict send paths never retry outside the registered topic."""
         registry = getattr(self, "_topic_route_registry", None)
         if registry is None:
             return None
-        if metadata and (
-            metadata.get("telegram_dm_topic_reply_fallback")
-            or metadata.get("telegram_dm_topic_created_for_send")
-        ):
+        # Strict mode may carry the legacy-named reply marker for an existing
+        # private topic. Exact registry resolution below is the authority and
+        # the strict send path never retries outside that route. Creating a
+        # topic during send remains forbidden.
+        if metadata and metadata.get("telegram_dm_topic_created_for_send"):
             return "topic_route_send_fallback_denied"
         try:
             registry.resolve(chat_id, thread_id)
@@ -1540,7 +1542,7 @@ class TelegramAdapter(BasePlatformAdapter):
         media_label: str,
         reset_media: Optional[Any] = None,
     ) -> Any:
-        """Retry stale private-topic media replies once without the topic anchor."""
+        """Retry stale private-topic media outside strict registered routing only."""
         try:
             return await send_fn(**send_kwargs)
         except Exception as send_err:
@@ -1549,6 +1551,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata,
                 reply_to_message_id,
             ):
+                raise
+            if getattr(self, "_topic_route_registry", None) is not None:
+                logger.warning("[%s] topic_route_reply_anchor_gone", self.name)
                 raise
             logger.warning(
                 "[%s] Reply target deleted for Telegram %s, "
@@ -4207,8 +4212,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
-        # Strict topic routing: outbound is origin-bound. Refuse fallback
-        # markers and unregistered destinations before anything sends.
+        # Strict topic routing: outbound is origin-bound. Refuse topic creation
+        # and unregistered destinations before anything sends.
         _strict_denied = self._strict_outbound_denied(
             chat_id, self._metadata_thread_id(metadata), metadata
         )
@@ -4979,6 +4984,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     break
                 except Exception as send_err:
                     if "reply message not found" in str(send_err).lower():
+                        if (
+                            getattr(self, "_topic_route_registry", None) is not None
+                            and metadata
+                            and metadata.get("telegram_dm_topic_reply_fallback")
+                        ):
+                            logger.warning(
+                                "[%s] topic_route_reply_anchor_gone", self.name
+                            )
+                            sent_msg = None
+                            break
                         # Drop the reply anchor and try again.  Private DM
                         # topic fallback needs the anchor and topic id together;
                         # forum topics can still safely keep message_thread_id.

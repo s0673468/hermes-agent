@@ -508,7 +508,7 @@ class TestCallbackGate:
 
 class TestOutboundGuard:
     @pytest.mark.asyncio
-    async def test_fallback_metadata_refused(self):
+    async def test_unregistered_private_topic_reply_metadata_refused(self):
         adapter = make_adapter()
         adapter._send_path_degraded = False
         result = await adapter.send(
@@ -517,7 +517,85 @@ class TestOutboundGuard:
             metadata={"telegram_dm_topic_reply_fallback": True, "thread_id": "5"},
         )
         assert result.success is False
-        assert result.error == "topic_route_send_fallback_denied"
+        assert result.error == "topic_route_unknown_thread"
+
+    def test_registered_private_topic_reply_metadata_allowed(self):
+        adapter = make_adapter()
+        metadata = {
+            "thread_id": "77",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "42",
+        }
+
+        assert adapter._strict_outbound_denied(OWNER, "77", metadata) is None
+
+    def test_topic_creation_metadata_remains_refused(self):
+        adapter = make_adapter()
+        metadata = {
+            "thread_id": "77",
+            "telegram_dm_topic_created_for_send": True,
+        }
+
+        assert (
+            adapter._strict_outbound_denied(OWNER, "77", metadata)
+            == "topic_route_send_fallback_denied"
+        )
+
+    @pytest.mark.asyncio
+    async def test_strict_private_overflow_never_retries_without_reply_anchor(self):
+        adapter = make_adapter()
+        adapter.truncate_message = MagicMock(return_value=["first", "second"])
+        adapter.format_message = lambda text: text
+        adapter._link_preview_kwargs = lambda: {}
+        adapter._notification_kwargs = lambda metadata: {}
+        adapter._bot.edit_message_text = AsyncMock()
+        adapter._bot.send_message = AsyncMock(
+            side_effect=RuntimeError("reply message not found")
+        )
+        metadata = {
+            "thread_id": "77",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "42",
+        }
+
+        result = await adapter._edit_overflow_split(
+            OWNER,
+            "91",
+            "oversized",
+            finalize=False,
+            metadata=metadata,
+        )
+
+        assert result.success is False
+        assert adapter._bot.send_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_strict_private_media_never_retries_without_reply_anchor(self):
+        class BadRequest(Exception):
+            pass
+
+        adapter = make_adapter()
+        send = AsyncMock(side_effect=BadRequest("message to be replied not found"))
+        metadata = {
+            "thread_id": "77",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "42",
+        }
+
+        with pytest.raises(BadRequest):
+            await adapter._send_with_dm_topic_reply_anchor_retry(
+                send,
+                {
+                    "chat_id": OWNER,
+                    "message_thread_id": 77,
+                    "reply_to_message_id": 42,
+                },
+                metadata,
+                42,
+                "photo",
+            )
+
+        assert send.await_count == 1
 
     @pytest.mark.asyncio
     async def test_unregistered_destination_refused(self):

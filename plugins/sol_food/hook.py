@@ -201,6 +201,12 @@ class SolFoodHook(TopicPluginHook):
             if not description:
                 await reply("Tell me what you ate after /food.")
                 return HookDecision.CONSUME
+            if len(description) > FOOD_TEXT_MAX_CHARS:
+                logger.info("[sol-food] %s", REASON_TEXT_TOO_LONG)
+                await reply(
+                    "That description is too long to log — please shorten it."
+                )
+                return HookDecision.CONSUME
             active = await self._store.active_proposal(
                 origin.owner_chat_id, origin.thread_id
             )
