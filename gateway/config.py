@@ -962,6 +962,19 @@ class GatewayConfig:
                 profile_routes,
                 multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             )
+        private_chat_routing = (
+            telegram.extra.get("private_chat_routing")
+            if telegram is not None and telegram.enabled
+            else None
+        )
+        if topic_routing and private_chat_routing:
+            raise ValueError(
+                "Telegram cannot combine topic_routing and private_chat_routing"
+            )
+        if isinstance(private_chat_routing, dict) and private_chat_routing:
+            from gateway.private_chat_routing import PrivateChatRouteRegistry
+
+            PrivateChatRouteRegistry.from_config(private_chat_routing)
 
         return cls(
             platforms=platforms,
