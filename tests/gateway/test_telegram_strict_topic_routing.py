@@ -47,8 +47,9 @@ def make_msg(
     message_id=42,
     photo=None,
     media_group_id=None,
+    is_forum=False,
 ):
-    chat = SimpleNamespace(id=chat_id, type=chat_type)
+    chat = SimpleNamespace(id=chat_id, type=chat_type, is_forum=is_forum)
     return SimpleNamespace(
         chat=chat,
         chat_id=chat_id,
@@ -112,19 +113,30 @@ class TestThreadKey:
         from plugins.platforms.telegram.adapter import TelegramAdapter
 
         msg = make_msg(thread_id=1, chat_type="private", is_topic=True)
-        assert TelegramAdapter._strict_thread_key(msg) == 1
+        assert TelegramAdapter._strict_thread_key(msg) == "1"
 
     def test_explicit_thread_never_rewritten(self):
         from plugins.platforms.telegram.adapter import TelegramAdapter
 
         msg = make_msg(thread_id=77, is_topic=True)
-        assert TelegramAdapter._strict_thread_key(msg) == 77
+        assert TelegramAdapter._strict_thread_key(msg) == "77"
 
     def test_group_root_stays_missing(self):
         from plugins.platforms.telegram.adapter import TelegramAdapter
 
         msg = make_msg(chat_type="supergroup", thread_id=None)
         assert TelegramAdapter._strict_thread_key(msg) is None
+
+    def test_forum_general_without_raw_thread_normalizes_to_one(self):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        msg = make_msg(
+            chat_type="supergroup",
+            thread_id=None,
+            is_topic=True,
+            is_forum=True,
+        )
+        assert TelegramAdapter._strict_thread_key(msg) == "1"
 
     def test_topic_message_without_id_stays_missing(self):
         from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -590,8 +602,11 @@ class TestOutboundGuard:
         adapter._bot.send_photo.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_origin_reply_keeps_general_thread_id(self):
+    async def test_origin_reply_normalizes_general_send_and_records_origin(self):
         adapter = make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=90)
+        )
         from gateway.topic_routing import RouteOrigin
 
         reply = adapter._origin_reply(
@@ -607,11 +622,12 @@ class TestOutboundGuard:
         adapter._bot.send_message.assert_awaited_once_with(
             chat_id=OWNER,
             text="hello",
-            message_thread_id=1,
+            message_thread_id=None,
         )
+        assert adapter._strict_message_origins[(OWNER, "90")] == 1
 
     @pytest.mark.asyncio
-    async def test_origin_presenter_keeps_actions_in_general_thread(self):
+    async def test_origin_presenter_normalizes_general_send_and_records_origin(self):
         adapter = make_adapter()
         adapter._bot.send_message = AsyncMock(
             return_value=SimpleNamespace(message_id=91)
@@ -627,10 +643,11 @@ class TestOutboundGuard:
         assert message_id == 91
         kwargs = adapter._bot.send_message.await_args.kwargs
         assert kwargs["chat_id"] == OWNER
-        assert kwargs["message_thread_id"] == 1
+        assert kwargs["message_thread_id"] is None
         assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data.startswith(
             "sf1:"
         )
+        assert adapter._strict_message_origins[(OWNER, "91")] == 1
 
     def test_strict_off_never_blocks(self):
         adapter = make_adapter(strict=False)

@@ -1054,16 +1054,16 @@ class TelegramAdapter(BasePlatformAdapter):
             raise ValueError("topic hook profile has no registered route")
         self._topic_hooks.register(hook)
 
-    @staticmethod
-    def _strict_thread_key(msg: Any) -> Any:
-        """Return only the thread id carried by the inbound update.
+    @classmethod
+    def _strict_thread_key(cls, msg: Any) -> Any:
+        """Use the adapter's forum-aware inbound thread normalization.
 
-        Strict topic mode never promotes a root/missing private-chat update to
-        General/1. Threaded private-chat updates identify General explicitly
-        as ``message_thread_id=1``; accepting a missing id as Sol would turn a
-        malformed, legacy, or non-topic delivery into an authenticated route.
+        Telegram omits ``message_thread_id`` for a forum's General topic, so
+        strict routing must recover its canonical id ``1``. The shared
+        normalizer deliberately leaves ordinary missing-thread private chats
+        and non-forum group messages missing, preserving fail-closed routing.
         """
-        return getattr(msg, "message_thread_id", None)
+        return cls._effective_message_thread_id(msg)
 
     #: Sentinel: strict topic mode is off; proceed with legacy behavior.
     _TOPIC_GATE_OFF = object()
@@ -1104,18 +1104,31 @@ class TelegramAdapter(BasePlatformAdapter):
         """Build the origin-bound reply callable handed to topic hooks.
 
         Destination is pinned to the origin (owner chat + registered
-        thread); hooks cannot select any other destination. General/1 stays
-        explicit: strict mode never relies on Telegram's threadless fallback.
+        thread); hooks cannot select any other destination. Sends reuse the
+        adapter's normal thread normalization, while successful message ids
+        retain their strict origin binding for later mutations.
         """
+
+        metadata = {"thread_id": str(origin.thread_id)}
+        thread_kwargs = self._thread_kwargs_for_send(
+            origin.owner_chat_id,
+            str(origin.thread_id),
+            metadata=metadata,
+        )
 
         async def _reply(text: str) -> None:
             bot = self._bot
             if bot is None:
                 return
-            await bot.send_message(
+            message = await bot.send_message(
                 chat_id=origin.owner_chat_id,
                 text=text,
-                message_thread_id=origin.thread_id,
+                **thread_kwargs,
+            )
+            self._record_strict_message_origin(
+                origin.owner_chat_id,
+                getattr(message, "message_id", None),
+                metadata,
             )
 
         async def _present_actions(text: str, actions: List[tuple[str, str]]) -> int:
@@ -1130,8 +1143,13 @@ class TelegramAdapter(BasePlatformAdapter):
             message = await bot.send_message(
                 chat_id=origin.owner_chat_id,
                 text=text,
-                message_thread_id=origin.thread_id,
                 reply_markup=InlineKeyboardMarkup(rows),
+                **thread_kwargs,
+            )
+            self._record_strict_message_origin(
+                origin.owner_chat_id,
+                getattr(message, "message_id", None),
+                metadata,
             )
             return int(message.message_id)
 
@@ -4235,7 +4253,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # Format and split through the shared deterministic plan. The live
             # canary recomputes this exact plan and binds its receipt to the
             # chunks acknowledged by Telegram.
-            chunks = prepare_legacy_text_chunks(content)
+            chunks = prepare_legacy_text_chunks(content, adapter=self)
             
             message_ids = []
             attempt_counts = []
@@ -9556,13 +9574,22 @@ def _resolve_notifications_mode() -> str:
     return mode
 
 
-def prepare_legacy_text_chunks(content: str) -> List[str]:
-    """Return the exact MarkdownV2 chunks used by ordinary Telegram sends."""
-    formatter = object.__new__(TelegramAdapter)
+def prepare_legacy_text_chunks(
+    content: str,
+    *,
+    adapter: Optional[TelegramAdapter] = None,
+) -> List[str]:
+    """Return the exact MarkdownV2 chunks used by ordinary Telegram sends.
+
+    The default path stays deterministic for the canary. Live sends pass their
+    adapter so configured/test-specific length and chunking behavior remains
+    part of the production plan rather than being silently bypassed.
+    """
+    formatter = adapter if adapter is not None else object.__new__(TelegramAdapter)
     formatted = TelegramAdapter.format_message(formatter, content)
-    chunks = BasePlatformAdapter.truncate_message(
+    chunks = formatter.truncate_message(
         formatted,
-        TelegramAdapter.MAX_MESSAGE_LENGTH,
+        formatter.MAX_MESSAGE_LENGTH,
         len_fn=utf16_len,
     )
     if len(chunks) > 1:
