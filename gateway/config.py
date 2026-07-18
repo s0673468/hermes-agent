@@ -928,9 +928,14 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
-        # Parse profile routes (validated by gateway.profile_routing)
+        # Parse profile routes (validated by gateway.profile_routing).  Keep
+        # ``from_dict`` at parity with ``load_gateway_config`` because callers
+        # such as ``hermes gateway --config`` pass the raw YAML mapping here.
+        raw_profile_routes = data.get("profile_routes")
+        if raw_profile_routes is None:
+            raw_profile_routes = nested_gateway.get("profile_routes")
         from gateway.profile_routing import parse_profile_routes
-        profile_routes = parse_profile_routes(data.get("profile_routes") or [])
+        profile_routes = parse_profile_routes(raw_profile_routes or [])
 
         # Strict topic admission and persona selection are two independent
         # layers. Validate them together at startup so an admitted route can

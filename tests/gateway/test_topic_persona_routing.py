@@ -383,6 +383,53 @@ class TestStrictPersonaAlignment:
             "metis",
         }
 
+    def test_gateway_config_enforces_nested_profile_routes_at_startup(self):
+        """Raw YAML callers may keep both multiplex settings under gateway."""
+        from gateway.config import GatewayConfig
+
+        topic_routes = [
+            {"chat_id": OWNER_CHAT, "thread_id": 1, "profile": "sol"},
+            {"chat_id": OWNER_CHAT, "thread_id": 77, "profile": "atlas"},
+            {"chat_id": OWNER_CHAT, "thread_id": 78, "profile": "metis"},
+        ]
+        raw_profile_routes = [
+            {
+                "name": route.name,
+                "platform": route.platform,
+                "chat_id": route.chat_id,
+                "thread_id": route.thread_id,
+                "profile": route.profile,
+            }
+            for route in _persona_routes()
+        ]
+
+        config = GatewayConfig.from_dict(
+            {
+                "gateway": {
+                    "multiplex_profiles": True,
+                    "profile_routes": raw_profile_routes,
+                },
+                "platforms": {
+                    "telegram": {
+                        "enabled": True,
+                        "token": "synthetic-test-token",
+                        "extra": {
+                            "topic_routing": {
+                                "mode": "strict",
+                                "routes": topic_routes,
+                            }
+                        },
+                    }
+                },
+            }
+        )
+
+        assert {route.profile for route in config.profile_routes} == {
+            "sol",
+            "atlas",
+            "metis",
+        }
+
     def test_disabled_telegram_leaves_stale_topic_routing_inert(self):
         from gateway.config import GatewayConfig, Platform
 
