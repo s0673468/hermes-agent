@@ -691,6 +691,99 @@ class TestCrashWindows:
         assert health.calls[1] == health.calls[0]
 
     @pytest.mark.asyncio
+    async def test_awaiting_commit_rejects_edit_and_cancel_then_reconciles_original(
+        self, tmp_path, clock, health
+    ):
+        hook = SolFoodHook(
+            state_dir=tmp_path / "cw-edit",
+            hermes_home=tmp_path / "cw-edit-h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        proposal_id, tokens, replies = await self._prep_single_candidate(hook)
+        cancel_token = tokens[ACTION_CANCEL]
+        health.error = HealthClientError(
+            "health_client_transport_error", retryable=True
+        )
+        await hook.on_callback(
+            SOL, origin(update_id=4250), tokens[ACTION_CONFIRM], replies
+        )
+        first_bytes = health.calls[0]
+        frozen, _frozen_update = hook._envelopes.load(proposal_id)
+        parser = AsyncMock(return_value=sample_candidates(2))
+        hook._parser = parser
+
+        decision = await hook.on_message(
+            SOL,
+            origin(update_id=4251),
+            "/food revised synthetic meal",
+            replies,
+        )
+
+        assert decision is HookDecision.CONSUME
+        parser.assert_not_awaited()
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.awaiting_commit is True
+        assert proposal.state is ProposalState.PENDING
+        assert hook._envelopes.load(proposal_id)[0].request_bytes == frozen.request_bytes
+
+        await hook.on_callback(
+            SOL, origin(update_id=4252), cancel_token, replies
+        )
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.awaiting_commit is True
+        assert proposal.state is ProposalState.PENDING
+
+        health.error = None
+        health.replayed = True
+        assert await hook.reconcile() == 1
+        assert health.calls == [first_bytes, first_bytes]
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.state is ProposalState.CONFIRMED
+
+    @pytest.mark.asyncio
+    async def test_confirm_racing_parser_rejects_edit_under_store_lock(
+        self, tmp_path, clock, health
+    ):
+        hook = SolFoodHook(
+            state_dir=tmp_path / "cw-edit-race",
+            hermes_home=tmp_path / "cw-edit-race-h",
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        proposal_id, tokens, replies = await self._prep_single_candidate(hook)
+        proposal = await hook._store.get(proposal_id)
+        original_version = proposal.version
+        original_hash = proposal.version_hash
+        health.error = HealthClientError(
+            "health_client_transport_error", retryable=True
+        )
+
+        async def parser_racing_confirm(_text, _image_path):
+            await hook.on_callback(
+                SOL, origin(update_id=4260), tokens[ACTION_CONFIRM], replies
+            )
+            return sample_candidates(2)
+
+        hook._parser = parser_racing_confirm
+        decision = await hook.on_message(
+            SOL,
+            origin(update_id=4261),
+            "/food revised while confirm races",
+            replies,
+        )
+
+        assert decision is HookDecision.CONSUME
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.awaiting_commit is True
+        assert proposal.version == original_version
+        assert proposal.version_hash == original_hash
+        assert len(health.calls) == 1
+        assert "pending" in replies.messages[-1]
+
+    @pytest.mark.asyncio
     async def test_cancel_race_discards_prefrozen_envelope(
         self, tmp_path, clock, health
     ):

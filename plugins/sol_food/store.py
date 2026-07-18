@@ -51,6 +51,7 @@ REASON_STALE_VERSION = "food_store_stale_version"
 REASON_EXPIRED = "food_store_expired"
 REASON_ALREADY_RESOLVED = "food_store_already_resolved"
 REASON_NOT_PENDING = "food_store_not_pending"
+REASON_COMMIT_PENDING = "food_store_commit_pending"
 REASON_BAD_PRESENTATION = "food_store_bad_presentation"
 
 
@@ -287,6 +288,11 @@ class FoodProposalStore:
                 raise ProposalError(REASON_UNKNOWN_TOKEN)
             if proposal.state is not ProposalState.PENDING:
                 raise ProposalError(REASON_NOT_PENDING)
+            if proposal.awaiting_commit:
+                # A consumed Confirm owns an immutable envelope until its
+                # receipt verifies.  This check is inside the same store lock
+                # as the edit so a concurrent Confirm cannot race it.
+                raise ProposalError(REASON_COMMIT_PENDING)
             if proposal.expired(now):
                 raise ProposalError(REASON_EXPIRED)
             validate_candidates(candidates)

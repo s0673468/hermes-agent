@@ -64,7 +64,11 @@ from plugins.sol_food.proposal import (
     ProposalState,
     render_display,
 )
-from plugins.sol_food.store import CallbackOutcome, FoodProposalStore
+from plugins.sol_food.store import (
+    REASON_COMMIT_PENDING as STORE_REASON_COMMIT_PENDING,
+    CallbackOutcome,
+    FoodProposalStore,
+)
 from plugins.sol_food.tokens import parse_token
 
 logger = logging.getLogger(__name__)
@@ -212,15 +216,32 @@ class SolFoodHook(TopicPluginHook):
             )
             if active is None:
                 await self.propose_from_text(origin, description, reply)
+            elif active.awaiting_commit:
+                # The consumed Confirm owns an immutable Health envelope until
+                # its verified receipt lands.  Do not let revised presentation
+                # state diverge from the bytes that reconcile() must replay.
+                await reply(_MSG_COMMIT_PENDING)
             else:
                 candidates = await self._run_parser(description, None)
                 if candidates is None:
                     await reply("I couldn't read that as a meal — nothing changed.")
                 else:
-                    revised, tokens = await self._store.edit_new_version(
-                        active.proposal_id, candidates
-                    )
-                    await self._present_proposal(revised, tokens, reply)
+                    try:
+                        revised, tokens = await self._store.edit_new_version(
+                            active.proposal_id, candidates
+                        )
+                    except ProposalError as err:
+                        # The store lock is authoritative if a Confirm races
+                        # this parser call.  Never let revised presentation
+                        # diverge from a frozen Health envelope.
+                        logger.info("[sol-food] %s", err.reason_code)
+                        await reply(
+                            _MSG_COMMIT_PENDING
+                            if err.reason_code == STORE_REASON_COMMIT_PENDING
+                            else _MSG_STALE
+                        )
+                    else:
+                        await self._present_proposal(revised, tokens, reply)
             return HookDecision.CONSUME
         return HookDecision.CONTINUE
 

@@ -247,6 +247,37 @@ class TestReplayAndConsumption:
         assert kinds == [CallbackOutcome.KIND_ACTION, CallbackOutcome.KIND_DENIED]
 
     @pytest.mark.asyncio
+    async def test_awaiting_commit_cannot_be_edited_under_store_lock(self, store):
+        proposal, tokens = await make_proposal(store)
+        await store.edit_new_version(proposal.proposal_id, [candidates(1)[0]])
+        proposal = await store.get(proposal.proposal_id)
+        confirm_token = next(
+            token
+            for token, record in proposal.tokens.items()
+            if (
+                record["action"] == ACTION_CONFIRM
+                and not record["consumed"]
+                and record["version"] == proposal.version
+            )
+        )
+        outcome = await store.resolve_callback(
+            **resolve_kwargs(confirm_token, message_id=None)
+        )
+        assert outcome.kind == CallbackOutcome.KIND_ACTION
+        before = await store.get(proposal.proposal_id)
+        before_version = before.version
+        before_hash = before.version_hash
+
+        with pytest.raises(ProposalError) as excinfo:
+            await store.edit_new_version(proposal.proposal_id, candidates(2))
+
+        assert excinfo.value.reason_code == "food_store_commit_pending"
+        after = await store.get(proposal.proposal_id)
+        assert after.awaiting_commit is True
+        assert after.version == before_version
+        assert after.version_hash == before_hash
+
+    @pytest.mark.asyncio
     async def test_cancel_scrubs_content(self, store):
         proposal, tokens = await make_proposal(store)
         outcome = await store.resolve_callback(
