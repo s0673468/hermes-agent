@@ -4091,7 +4091,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_path_degraded = True
 
         # Stop hook-owned workers before their adapter transport disappears.
-        await self._topic_hooks.stop()
+        # ``disconnect`` is also the cleanup path for partially constructed
+        # adapters (for example, when ``connect`` fails before topic hooks are
+        # initialized), so teardown must tolerate the registry being absent.
+        topic_hooks = getattr(self, "_topic_hooks", None)
+        if topic_hooks is not None:
+            await topic_hooks.stop()
 
         # Recovery can be suspended in stop/drain/start while disconnect begins.
         # Cancel and await both polling lifecycle owners immediately after the
