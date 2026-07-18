@@ -68,6 +68,7 @@ from plugins.sol_food.store import (
     REASON_COMMIT_PENDING as STORE_REASON_COMMIT_PENDING,
     CallbackOutcome,
     FoodProposalStore,
+    _fsync_directory,
 )
 from plugins.sol_food.tokens import parse_token
 
@@ -131,6 +132,7 @@ class _EnvelopeStore:
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(blob)
+                os.fchmod(handle.fileno(), FOOD_CACHE_FILE_MODE)
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError:
@@ -140,7 +142,7 @@ class _EnvelopeStore:
                 pass
             raise
         os.replace(tmp, path)
-        os.chmod(path, FOOD_CACHE_FILE_MODE)
+        _fsync_directory(self._dir)
 
     def load(self, proposal_id: str) -> Optional[tuple[FrozenEnvelope, int]]:
         path = self._path(proposal_id)
@@ -151,11 +153,16 @@ class _EnvelopeStore:
         except (OSError, ValueError, KeyError, HealthClientError):
             return None
 
-    def delete(self, proposal_id: str) -> None:
+    def delete(self, proposal_id: str) -> bool:
         try:
             os.unlink(self._path(proposal_id))
+            _fsync_directory(self._dir)
+            return True
+        except FileNotFoundError:
+            return True
         except OSError:
-            pass
+            logger.warning("[sol-food] sol_food_envelope_delete_failed")
+            return False
 
     def pending_ids(self) -> List[str]:
         return [p.stem for p in self._dir.glob("*.json")]
@@ -171,26 +178,90 @@ class SolFoodHook(TopicPluginHook):
         state_dir: Path,
         hermes_home: Path,
         health_client: HealthFoodClient,
+        additional_legacy_guard_homes: Sequence[Path] = (),
         parser: Optional[ParserFn] = None,
         clock: Callable[[], float] = time.time,
+        reconcile_retry_seconds: float = 30.0,
     ) -> None:
         # Single-writer guard: refuse to exist while the legacy
         # append-style helper is present (raises LegacyHelperPresent).
-        # Caller contract: ``hermes_home`` MUST be the ACTIVE profile's
-        # Hermes home (the directory the running gateway resolves) — the
-        # guard inspects exactly that tree, so pointing it anywhere else
-        # would void the single-writer property.
-        assert_legacy_helper_disabled(hermes_home)
+        # The old untracked helper historically lived in the default Hermes
+        # root, while multiplexed transport state lives under the routed Sol
+        # profile. Guard every explicitly bound root before constructing any
+        # new writer state; neither location may retain the legacy path.
+        guard_homes = (Path(hermes_home),) + tuple(
+            Path(home) for home in additional_legacy_guard_homes
+        )
+        for guard_home in dict.fromkeys(guard_homes):
+            assert_legacy_helper_disabled(guard_home)
         self._store = FoodProposalStore(Path(state_dir), clock=clock)
         self._cache = FoodImageCache(Path(state_dir))
         self._envelopes = _EnvelopeStore(Path(state_dir))
         self._health = health_client
         self._parser = parser
         self._clock = clock
+        self._reconcile_retry_seconds = max(float(reconcile_retry_seconds), 0.001)
+        self._started = False
+        self._reconcile_task: Optional[asyncio.Task[None]] = None
+        self._reconcile_stop = asyncio.Event()
         # proposal_id -> cached image id (transient; store survives restart,
         # images are re-derived or already terminal-deleted).
         self._proposal_images: Dict[str, str] = {}
         self._cache.sweep_orphans()
+
+    async def start(self) -> None:
+        """Start exactly one bounded reconciliation worker."""
+        self._reconcile_stop.clear()
+        self._started = True
+        self._ensure_reconcile_task()
+
+    async def stop(self) -> None:
+        """Cancel and await the reconciliation worker."""
+        self._started = False
+        task = self._reconcile_task
+        self._reconcile_stop.set()
+        if task is not None and not task.done():
+            # Do not cancel a commit already running in the executor: Python
+            # cannot stop that thread, and disconnect must not pretend it did.
+            await asyncio.gather(task, return_exceptions=True)
+        self._reconcile_task = None
+
+    def _ensure_reconcile_task(self) -> None:
+        if not self._started or not self._envelopes.pending_ids():
+            return
+        task = self._reconcile_task
+        if task is not None and not task.done():
+            return
+        self._reconcile_task = asyncio.create_task(
+            self._reconcile_until_idle(), name="sol-food-reconcile"
+        )
+
+    async def _reconcile_until_idle(self) -> None:
+        current = asyncio.current_task()
+        try:
+            while self._started and self._envelopes.pending_ids():
+                try:
+                    await self.reconcile()
+                except Exception:
+                    # Stable value-free reason only. Keep frozen bytes for the
+                    # next bounded retry rather than leaking private failures.
+                    logger.warning("[sol-food] sol_food_reconcile_failed")
+                if self._started and self._envelopes.pending_ids():
+                    try:
+                        await asyncio.wait_for(
+                            self._reconcile_stop.wait(),
+                            timeout=self._reconcile_retry_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            if self._reconcile_task is current:
+                self._reconcile_task = None
+                # A Confirm can freeze a new envelope while this worker is
+                # between its final pending check and task finalization.
+                # Re-arm from the persisted queue so that race cannot strand
+                # an awaiting commit until another process restart.
+                self._ensure_reconcile_task()
 
     # ── generic seam: messages ──────────────────────────────────────────
     async def on_message(
@@ -635,6 +706,7 @@ class SolFoodHook(TopicPluginHook):
             logger.info("[sol-food] %s", err.reason_code)
             if err.retryable:
                 # Envelope stays frozen; reconcile() retries identical bytes.
+                self._ensure_reconcile_task()
                 await reply(_MSG_COMMIT_PENDING)
             else:
                 await self._store.mark_terminal(proposal_id, ProposalState.CANCELLED)
@@ -665,6 +737,11 @@ class SolFoodHook(TopicPluginHook):
                 continue
             proposal = await self._store.get(proposal_id)
             if proposal is not None:
+                if proposal.state is ProposalState.CONFIRMED:
+                    # Receipt linkage is already durable. A prior envelope
+                    # unlink/fsync failure must never cause another HTTP commit.
+                    self._envelopes.delete(proposal_id)
+                    continue
                 if proposal.state in (ProposalState.CANCELLED, ProposalState.EXPIRED):
                     # A terminal non-confirmed proposal owns no commit.
                     self._envelopes.delete(proposal_id)

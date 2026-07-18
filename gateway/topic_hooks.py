@@ -165,6 +165,12 @@ class TopicPluginHook:
     #: Callback-data prefixes owned by this hook (e.g. ``("sf1:",)``).
     callback_prefixes: Tuple[str, ...] = ()
 
+    async def start(self) -> None:
+        """Start background work after the owning adapter is connected."""
+
+    async def stop(self) -> None:
+        """Stop and await background work before the adapter disconnects."""
+
     async def on_message(
         self, route: TopicRoute, origin: RouteOrigin, text: str, reply: ReplyFn
     ) -> HookDecision:
@@ -213,8 +219,11 @@ class TopicHookRegistry:
     def __init__(self) -> None:
         self._by_profile: Dict[str, TopicPluginHook] = {}
         self._by_prefix: Dict[str, TopicPluginHook] = {}
+        self._started = False
 
     def register(self, hook: TopicPluginHook) -> None:
+        if self._started:
+            raise RuntimeError("cannot register topic hook after lifecycle start")
         if not hook.profile or not isinstance(hook.profile, str):
             raise ValueError("topic hook requires a non-empty profile binding")
         if hook.profile in self._by_profile:
@@ -227,6 +236,35 @@ class TopicHookRegistry:
         self._by_profile[hook.profile] = hook
         for prefix in hook.callback_prefixes:
             self._by_prefix[prefix] = hook
+
+    async def start(self) -> None:
+        """Start each registered hook once, in registration order."""
+        if self._started:
+            return
+        started: List[TopicPluginHook] = []
+        try:
+            for hook in self._by_profile.values():
+                await hook.start()
+                started.append(hook)
+        except Exception:
+            for hook in reversed(started):
+                try:
+                    await hook.stop()
+                except Exception:
+                    logger.warning("[topic-hooks] %s", REASON_HOOK_ERROR)
+            raise
+        self._started = True
+
+    async def stop(self) -> None:
+        """Stop each started hook once, in reverse registration order."""
+        if not self._started:
+            return
+        self._started = False
+        for hook in reversed(tuple(self._by_profile.values())):
+            try:
+                await hook.stop()
+            except Exception:
+                logger.warning("[topic-hooks] %s", REASON_HOOK_ERROR)
 
     def hook_for(self, route: TopicRoute) -> Optional[TopicPluginHook]:
         return self._by_profile.get(route.profile)

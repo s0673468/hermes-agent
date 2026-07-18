@@ -13,8 +13,8 @@ import pytest
 
 from gateway.topic_hooks import HookDecision, MediaDescriptor
 from gateway.topic_routing import RouteOrigin, TopicRoute
-from plugins.sol_food.health_client import HealthClientError
-from plugins.sol_food.hook import SolFoodHook
+from plugins.sol_food.health_client import FrozenEnvelope, HealthClientError
+from plugins.sol_food.hook import SolFoodHook, _EnvelopeStore
 from plugins.sol_food.legacy_guard import LegacyHelperPresent
 from plugins.sol_food.limits import (
     FOOD_CAPTION_MAX_CHARS,
@@ -88,6 +88,51 @@ class FakeHealthClient:
             replayed=self.replayed,
             receipt=receipt,
         )
+
+
+@pytest.mark.asyncio
+async def test_envelope_publish_and_delete_fsync_parent_directory(
+    tmp_path, monkeypatch
+):
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+    real_unlink = os.unlink
+
+    def tracked_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        events.append("fsync_dir" if stat.S_ISDIR(mode) else "fsync_file")
+        return real_fsync(fd)
+
+    def tracked_replace(src, dst):
+        events.append("replace")
+        return real_replace(src, dst)
+
+    def tracked_unlink(path):
+        events.append("unlink")
+        return real_unlink(path)
+
+    monkeypatch.setattr(os, "fsync", tracked_fsync)
+    monkeypatch.setattr(os, "replace", tracked_replace)
+    monkeypatch.setattr(os, "unlink", tracked_unlink)
+    store = _EnvelopeStore(tmp_path)
+    request_bytes = b"{}"
+    envelope = FrozenEnvelope(
+        mutation_id="00000000-0000-4000-8000-000000000001",
+        entry_id="00000000-0000-4000-8000-000000000002",
+        operation="create",
+        expected_revision=0,
+        request_bytes=request_bytes,
+        request_sha256=hashlib.sha256(request_bytes).hexdigest(),
+    )
+
+    store.save("proposal", envelope, 123)
+    assert events.index("fsync_file") < events.index("replace")
+    assert events.index("replace") < events.index("fsync_dir")
+
+    events.clear()
+    store.delete("proposal")
+    assert events == ["unlink", "fsync_dir"]
 
 
 def sample_candidates(n=2):
@@ -478,6 +523,43 @@ class TestCallbacks:
 
 class TestFrozenRetry:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reason",
+        ["health_client_bad_response", "health_client_receipt_mismatch"],
+    )
+    async def test_post_200_ambiguity_retains_and_replays_exact_envelope(
+        self, hook, health, reason
+    ):
+        health.error = HealthClientError(reason, retryable=True)
+        replies = Replies()
+        proposal_id = await hook.propose_from_text(
+            origin(), "synthetic meal", replies
+        )
+        proposal = await hook._store.get(proposal_id)
+        tokens = {r["action"]: t for t, r in proposal.tokens.items()}
+        await hook.on_callback(
+            SOL, origin(update_id=2170), tokens["choice:0"], replies
+        )
+        proposal = await hook._store.get(proposal_id)
+        tokens = {
+            r["action"]: t for t, r in proposal.tokens.items() if not r["consumed"]
+        }
+        await hook.on_callback(
+            SOL, origin(update_id=2171), tokens[ACTION_CONFIRM], replies
+        )
+
+        frozen, _ = hook._envelopes.load(proposal_id)
+        assert frozen.request_bytes == health.calls[0]
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.awaiting_commit is True
+        assert proposal.state is ProposalState.PENDING
+
+        health.error = None
+        health.replayed = True
+        assert await hook.reconcile() == 1
+        assert health.calls == [frozen.request_bytes, frozen.request_bytes]
+
+    @pytest.mark.asyncio
     async def test_transport_loss_retries_identical_bytes(self, hook, health):
         health.error = HealthClientError("health_client_transport_error", retryable=True)
         replies = Replies()
@@ -539,6 +621,70 @@ class TestFrozenRetry:
         count = await reborn.reconcile()
         assert count == 1
         assert health.calls[-1] == first_bytes
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_reconciles_on_start_retries_and_never_duplicates_task(
+        self, tmp_path, clock, health
+    ):
+        state_dir = tmp_path / "lifecycle-reconcile"
+        home = tmp_path / "lifecycle-home"
+        original = SolFoodHook(
+            state_dir=state_dir,
+            hermes_home=home,
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+        )
+        health.error = HealthClientError(
+            "health_client_transport_error", retryable=True
+        )
+        replies = Replies()
+        proposal_id = await original.propose_from_text(
+            origin(), "synthetic meal", replies
+        )
+        proposal = await original._store.get(proposal_id)
+        tokens = {r["action"]: t for t, r in proposal.tokens.items()}
+        await original.on_callback(
+            SOL, origin(update_id=2350), tokens["choice:0"], replies
+        )
+        proposal = await original._store.get(proposal_id)
+        tokens = {
+            r["action"]: t for t, r in proposal.tokens.items() if not r["consumed"]
+        }
+        await original.on_callback(
+            SOL, origin(update_id=2351), tokens[ACTION_CONFIRM], replies
+        )
+        first_bytes = health.calls[0]
+
+        reborn = SolFoodHook(
+            state_dir=state_dir,
+            hermes_home=home,
+            health_client=health,
+            parser=default_parser,
+            clock=clock,
+            reconcile_retry_seconds=0.01,
+        )
+        await reborn.start()
+        await reborn.start()
+        for _ in range(50):
+            if len(health.calls) >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert health.calls[:2] == [first_bytes, first_bytes]
+
+        health.error = None
+        health.replayed = True
+        for _ in range(100):
+            if reborn._envelopes.pending_ids() == []:
+                break
+            await asyncio.sleep(0.005)
+        assert reborn._envelopes.pending_ids() == []
+        assert health.calls == [first_bytes, first_bytes, first_bytes]
+
+        await reborn.start()
+        await asyncio.sleep(0.02)
+        assert health.calls == [first_bytes, first_bytes, first_bytes]
+        await reborn.stop()
 
 
 class TestCrashWindows:

@@ -90,13 +90,14 @@ def _parser_for(llm):
     return _parse
 
 
-def _build_topic_hook(llm=None):
+def _build_topic_hook(llm=None, *, profile: str = "sol"):
     """Build the Sol hook only after explicit strict-route activation.
 
     Plugin discovery itself remains inert: no credential is read and no state
     directory is created until ``topic_routing.hooks`` contains ``sol``.
     """
-    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_constants import get_default_hermes_root
     from plugins.sol_food.health_client import HealthClientError, HealthFoodClient
     from plugins.sol_food.hook import SolFoodHook
 
@@ -109,10 +110,15 @@ def _build_topic_hook(llm=None):
     except HealthClientError as exc:
         # Stable reason code only; never echo the endpoint or credential.
         raise RuntimeError(exc.reason_code) from None
-    hermes_home = Path(get_hermes_home())
+    # The hook factory is instantiated by the default multiplex gateway, not
+    # inside the routed profile's process scope. Resolve its state and legacy
+    # single-writer guard from the explicitly registered route profile.
+    profile_home = Path(get_profile_dir(profile))
+    default_home = Path(get_default_hermes_root())
     return SolFoodHook(
-        state_dir=hermes_home / "state" / "sol-food",
-        hermes_home=hermes_home,
+        state_dir=profile_home / "state" / "sol-food",
+        hermes_home=default_home,
+        additional_legacy_guard_homes=(profile_home,),
         health_client=health_client,
         parser=_parser_for(llm) if llm is not None else None,
     )
@@ -122,4 +128,6 @@ def register(ctx) -> None:
     """Advertise the Sol hook through the generic lazy factory seam."""
     # Capture the context, not the facade: discovery remains inert and the
     # host-owned LLM is constructed only when strict config activates Sol.
-    ctx.register_topic_hook_factory("sol", lambda: _build_topic_hook(ctx.llm))
+    ctx.register_topic_hook_factory(
+        "sol", lambda: _build_topic_hook(ctx.llm, profile="sol")
+    )

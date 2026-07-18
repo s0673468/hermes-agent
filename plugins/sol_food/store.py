@@ -55,6 +55,16 @@ REASON_COMMIT_PENDING = "food_store_commit_pending"
 REASON_BAD_PRESENTATION = "food_store_bad_presentation"
 
 
+def _fsync_directory(path: Path) -> None:
+    """Commit rename/unlink metadata in ``path`` to durable storage."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class CallbackOutcome:
     """Result of resolving one callback update against the store."""
 
@@ -132,6 +142,7 @@ class FoodProposalStore:
             backup = self._file.with_suffix(".corrupt")
             try:
                 os.replace(self._file, backup)
+                _fsync_directory(self._dir)
             except OSError:
                 pass
             return
@@ -158,6 +169,7 @@ class FoodProposalStore:
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(blob)
+                os.fchmod(handle.fileno(), FOOD_CACHE_FILE_MODE)
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError:
@@ -167,7 +179,7 @@ class FoodProposalStore:
                 pass
             raise
         os.replace(tmp, self._file)
-        os.chmod(self._file, FOOD_CACHE_FILE_MODE)
+        _fsync_directory(self._dir)
 
     # ── internal upkeep (call under lock) ───────────────────────────────
     def _sweep_locked(self, now: float) -> bool:
@@ -203,7 +215,7 @@ class FoodProposalStore:
                 proposal.owner_chat_id == owner_chat_id
                 and proposal.thread_id == thread_id
                 and proposal.state is ProposalState.PENDING
-                and not proposal.expired(now)
+                and (proposal.awaiting_commit or not proposal.expired(now))
             ):
                 return proposal
         return None

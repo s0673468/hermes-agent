@@ -3984,6 +3984,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # though polling/webhook is already live (#46298). Defer them to a
             # cancellable background task so connect() returns as soon as the
             # transport is up.
+            # Authenticated post-route hooks may own restart reconciliation,
+            # but only after Telegram itself is live.
+            await self._topic_hooks.start()
             self._start_post_connect_housekeeping()
 
             return True
@@ -4086,6 +4089,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
+
+        # Stop hook-owned workers before their adapter transport disappears.
+        await self._topic_hooks.stop()
 
         # Recovery can be suspended in stop/drain/start while disconnect begins.
         # Cancel and await both polling lifecycle owners immediately after the

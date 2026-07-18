@@ -123,6 +123,10 @@ platforms:
 ```
 
 Each `hooks` entry binds a route profile to the exact plugin id that owns its lazy factory.
+Hook state is resolved from that routed profile's home, even though the factory is
+instantiated by the default multiplex gateway. Once Telegram is connected, the adapter
+starts hook lifecycle work (including durable exact-envelope reconciliation) and awaits
+its stop hook before transport teardown.
 Plugin discovery only registers lazy factories; enabling a hook constructs it at adapter
 startup. An unknown, wrong-owner, duplicate,
 unrouted, misbound, or misconfigured hook fails startup. Omitting `hooks` leaves all plugin

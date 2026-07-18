@@ -6,6 +6,7 @@ import pytest
 
 import plugins.sol_food as sol_food
 from plugins.sol_food.hook import SolFoodHook
+from plugins.sol_food.legacy_guard import LegacyHelperPresent
 
 
 class _Context:
@@ -67,9 +68,41 @@ def test_explicit_construction_uses_owner_private_profile_state(
     monkeypatch.setenv("HEALTH_FOOD_COMMIT_TOKEN", token)
     hook = sol_food._build_topic_hook()
     assert isinstance(hook, SolFoodHook)
-    state_dir = tmp_path / "state" / "sol-food"
+    state_dir = tmp_path / "profiles" / "sol" / "state" / "sol-food"
     assert state_dir.is_dir()
     assert state_dir.stat().st_mode & 0o777 == 0o700
+    assert not (tmp_path / "state" / "sol-food").exists()
+
+
+def test_explicit_construction_checks_legacy_helper_in_routed_sol_profile(
+    monkeypatch, tmp_path: Path
+) -> None:
+    token = "A" * 43
+    sol_home = tmp_path / "profiles" / "sol"
+    legacy = sol_home / "scripts" / "food_log_commit.py"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("legacy", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HEALTH_FOOD_COMMIT_URL", "http://127.0.0.1:8765/food")
+    monkeypatch.setenv("HEALTH_FOOD_COMMIT_TOKEN", token)
+
+    with pytest.raises(LegacyHelperPresent, match="sol_food_legacy_helper_present"):
+        sol_food._build_topic_hook()
+
+
+def test_explicit_construction_checks_legacy_helper_in_default_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    token = "A" * 43
+    legacy = tmp_path / "scripts" / "food_log_commit.py"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("legacy", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HEALTH_FOOD_COMMIT_URL", "http://127.0.0.1:8765/food")
+    monkeypatch.setenv("HEALTH_FOOD_COMMIT_TOKEN", token)
+
+    with pytest.raises(LegacyHelperPresent, match="sol_food_legacy_helper_present"):
+        sol_food._build_topic_hook()
 
 
 def test_invalid_secret_fails_without_echo(monkeypatch, tmp_path: Path) -> None:
