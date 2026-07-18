@@ -1109,6 +1109,34 @@ class TelegramAdapter(BasePlatformAdapter):
             raise ValueError("conversation hook profile has no registered route")
         self._topic_hooks.register(hook)
 
+    def _configured_strict_registry(self) -> Any:
+        """Return the active strict registry without changing legacy topic state.
+
+        A few narrow adapter tests construct instances without running
+        ``__init__``.  Resolve the registry from its authoritative mode-specific
+        attribute so topic routing keeps its established thread-sensitive
+        behaviour and private-chat routing remains an additive mode.
+        """
+
+        private_registry = getattr(self, "_private_chat_route_registry", None)
+        if private_registry is not None:
+            return private_registry
+        return getattr(self, "_topic_route_registry", None)
+
+    def _strict_route_thread_key(self, msg: Any) -> Any:
+        """Return the mode-appropriate inbound thread key.
+
+        Forum routing retains its established normalization.  A dedicated
+        private bot rejects any raw ``message_thread_id`` even when Telegram
+        does not set ``is_topic_message``; accepting that inconsistent update
+        would let it reach session/media/command setup as an unthreaded DM.
+        """
+
+        if getattr(self, "_private_chat_route_registry", None) is not None:
+            thread_id = getattr(msg, "message_thread_id", None)
+            return str(thread_id) if thread_id is not None else None
+        return self._strict_thread_key(msg)
+
     @classmethod
     def _strict_thread_key(cls, msg: Any) -> Any:
         """Use the adapter's forum-aware inbound thread normalization.
@@ -1304,7 +1332,7 @@ class TelegramAdapter(BasePlatformAdapter):
         does not resolve to a registered route.  The legacy-named reply marker
         is allowed only because exact registry resolution remains authoritative;
         strict send paths never retry outside the registered topic."""
-        registry = getattr(self, "_strict_route_registry", None)
+        registry = self._configured_strict_registry()
         if registry is None:
             return None
         # Strict mode may carry the legacy-named reply marker for an existing
@@ -1326,7 +1354,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self, value: Any, chat_id: Any, thread_id: Optional[str]
     ) -> Any:
         """Bind interactive state to its exact strict-mode origin tuple."""
-        if getattr(self, "_strict_route_registry", None) is None:
+        if self._configured_strict_registry() is None:
             return value
         return {
             "value": value,
@@ -1337,7 +1365,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self, state: Any, chat_id: Any, thread_id: Any
     ) -> Any:
         """Return state value only when its strict origin exactly matches."""
-        if getattr(self, "_strict_route_registry", None) is None:
+        if self._configured_strict_registry() is None:
             return state
         if not isinstance(state, dict) or set(state) != {"value", "origin"}:
             return None
@@ -1347,7 +1375,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return state["value"]
 
     def _model_picker_key(self, chat_id: Any, thread_id: Any = None) -> Any:
-        if getattr(self, "_strict_route_registry", None) is None:
+        if self._configured_strict_registry() is None:
             return str(chat_id)
         return (str(chat_id), str(thread_id) if thread_id is not None else None)
 
@@ -1357,7 +1385,7 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id: Any,
         metadata: Optional[Dict[str, Any]],
     ) -> None:
-        if getattr(self, "_strict_route_registry", None) is None or message_id is None:
+        if self._configured_strict_registry() is None or message_id is None:
             return
         thread_id = self._metadata_thread_id(metadata)
         if self._strict_outbound_denied(chat_id, thread_id, metadata) is not None:
@@ -1376,7 +1404,7 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id: Any,
         metadata: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        if getattr(self, "_strict_route_registry", None) is None:
+        if self._configured_strict_registry() is None:
             return None
         thread_id = self._metadata_thread_id(metadata)
         denied = self._strict_outbound_denied(chat_id, thread_id, metadata)
@@ -1398,7 +1426,7 @@ class TelegramAdapter(BasePlatformAdapter):
         status_key: Any,
         metadata: Optional[Dict[str, Any]],
     ) -> tuple:
-        if getattr(self, "_strict_route_registry", None) is None:
+        if self._configured_strict_registry() is None:
             return (str(chat_id), str(status_key))
         return (
             str(chat_id),
@@ -1650,7 +1678,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id,
             ):
                 raise
-            if getattr(self, "_strict_route_registry", None) is not None:
+            if self._configured_strict_registry() is not None:
                 logger.warning("[%s] topic_route_reply_anchor_gone", self.name)
                 raise
             logger.warning(
@@ -4510,7 +4538,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 # Strict topic mode: a routed send NEVER falls
                                 # back outside its registered thread — fail
                                 # closed instead of degrading to a plain send.
-                                if getattr(self, "_strict_route_registry", None) is not None:
+                                if self._configured_strict_registry() is not None:
                                     logger.warning(
                                         "[%s] topic_route_thread_gone", self.name
                                     )
@@ -5095,7 +5123,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception as send_err:
                     if "reply message not found" in str(send_err).lower():
                         if (
-                            getattr(self, "_strict_route_registry", None) is not None
+                            self._configured_strict_registry() is not None
                             and metadata
                             and metadata.get("telegram_dm_topic_reply_fallback")
                         ):
@@ -5361,7 +5389,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ):
                 # Strict topic mode: control sends never fall back outside
                 # their registered thread either — fail closed.
-                if getattr(self, "_strict_route_registry", None) is not None:
+                if self._configured_strict_registry() is not None:
                     logger.warning("[%s] topic_route_thread_gone", self.name)
                     raise
                 logger.warning(
@@ -8559,7 +8587,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # batching, or tool work; unroutable updates fail closed.
         gate = self._resolve_topic_route(
             getattr(getattr(msg, "chat", None), "id", None),
-            self._strict_thread_key(msg),
+            self._strict_route_thread_key(msg),
             update.update_id,
             getattr(msg, "message_id", None),
             chat_type=getattr(getattr(msg, "chat", None), "type", None),
@@ -8606,7 +8634,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # profile processing in ``_should_process_message``.
         gate = self._resolve_topic_route(
             getattr(getattr(msg, "chat", None), "id", None),
-            self._strict_thread_key(msg),
+            self._strict_route_thread_key(msg),
             update.update_id,
             getattr(msg, "message_id", None),
             chat_type=getattr(getattr(msg, "chat", None), "type", None),
@@ -8650,7 +8678,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if (
             self._resolve_topic_route(
                 getattr(getattr(msg, "chat", None), "id", None),
-                self._strict_thread_key(msg),
+                self._strict_route_thread_key(msg),
                 getattr(update, "update_id", None),
                 getattr(msg, "message_id", None),
                 chat_type=getattr(getattr(msg, "chat", None), "type", None),
@@ -8869,7 +8897,7 @@ class TelegramAdapter(BasePlatformAdapter):
         strict_media_origin = None
         gate = self._resolve_topic_route(
             getattr(getattr(update.message, "chat", None), "id", None),
-            self._strict_thread_key(update.message),
+            self._strict_route_thread_key(update.message),
             update.update_id,
             getattr(update.message, "message_id", None),
             chat_type=getattr(getattr(update.message, "chat", None), "type", None),
