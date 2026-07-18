@@ -16,6 +16,7 @@ from plugins.sol_food.health_client import HealthClientError
 from plugins.sol_food.hook import SolFoodHook
 from plugins.sol_food.legacy_guard import LegacyHelperPresent
 from plugins.sol_food.limits import (
+    FOOD_CAPTION_MAX_CHARS,
     FOOD_PARSE_DEADLINE_SECONDS,
     FOOD_TEXT_MAX_CHARS,
 )
@@ -43,6 +44,18 @@ class Replies:
 
     async def __call__(self, text: str) -> None:
         self.messages.append(text)
+
+
+class PresentedReplies(Replies):
+    def __init__(self):
+        super().__init__()
+        self.actions = []
+        self.present_actions = self._present_actions
+
+    async def _present_actions(self, text, actions):
+        self.messages.append(text)
+        self.actions = actions
+        return 909
 
 
 class FakeHealthClient:
@@ -145,6 +158,36 @@ class TestConversation:
         assert decision is HookDecision.CONTINUE
         assert replies.messages == []
 
+    @pytest.mark.asyncio
+    async def test_explicit_food_text_creates_proposal_and_consumes(self, hook):
+        replies = Replies()
+        decision = await hook.on_message(
+            SOL, origin(), "/food synthetic meal", replies
+        )
+        assert decision is HookDecision.CONSUME
+        assert await hook._store.has_active_proposal("208214988", 1)
+
+    @pytest.mark.asyncio
+    async def test_downloaded_sol_photo_creates_proposal_and_consumes(self, hook):
+        replies = Replies()
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + b"\x00\x00\x00\rIHDR"
+            + (64).to_bytes(4, "big")
+            + (64).to_bytes(4, "big")
+            + b"\x08\x02\x00\x00\x00"
+        )
+        decision = await hook.on_media_downloaded(
+            SOL,
+            origin(),
+            MediaDescriptor("photo", len(png), 64, 64, None),
+            png,
+            None,
+            replies,
+        )
+        assert decision is HookDecision.CONSUME
+        assert await hook._store.has_active_proposal("208214988", 1)
+
 
 class TestTextProposal:
     @pytest.mark.asyncio
@@ -170,6 +213,23 @@ class TestTextProposal:
         proposal_id = await hook.propose_from_text(origin(), "synthetic meal", replies)
         assert proposal_id is not None
         assert health.calls == []  # candidates never write
+
+    @pytest.mark.asyncio
+    async def test_origin_presenter_binds_opaque_buttons_before_callback(self, hook):
+        replies = PresentedReplies()
+        proposal_id = await hook.propose_from_text(
+            origin(), "synthetic meal", replies
+        )
+        proposal = await hook._store.get(proposal_id)
+        assert proposal.presentation_message_id == 909
+        assert [label for label, _token in replies.actions] == [
+            "Option 1",
+            "Option 2",
+            "Confirm",
+            "Edit",
+            "Cancel",
+        ]
+        assert all(token.startswith("sf1:") for _label, token in replies.actions)
 
 
 class TestParserCeilings:
@@ -247,6 +307,20 @@ class TestMediaGate:
         )
         decision = await hook.on_media_pre_download(SOL, origin(), media, replies)
         assert decision is HookDecision.CONTINUE
+
+    @pytest.mark.asyncio
+    async def test_overlong_caption_denied_before_download(self, hook):
+        replies = Replies()
+        media = MediaDescriptor(
+            kind="photo",
+            file_size=100,
+            width=10,
+            height=10,
+            media_group_id=None,
+            caption_length=FOOD_CAPTION_MAX_CHARS + 1,
+        )
+        decision = await hook.on_media_pre_download(SOL, origin(), media, replies)
+        assert decision is HookDecision.DENY
 
     @pytest.mark.asyncio
     async def test_non_photo_media_ignored(self, hook):

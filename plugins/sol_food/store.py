@@ -215,6 +215,16 @@ class FoodProposalStore:
                 self._persist()
             return self._active_for_origin_locked(owner_chat_id, thread_id, now) is not None
 
+    async def active_proposal(
+        self, owner_chat_id: str, thread_id: int
+    ) -> Optional[FoodProposal]:
+        """Return the current owner+thread proposal for an explicit revision."""
+        async with self._lock:
+            now = self._clock()
+            if self._sweep_locked(now):
+                self._persist()
+            return self._active_for_origin_locked(owner_chat_id, thread_id, now)
+
     async def create(
         self,
         *,

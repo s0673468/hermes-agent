@@ -12,11 +12,10 @@ route profile (owner chat + General topic id 1) and owns:
 - the one reviewed Health writer: the v3 commit client with frozen
   envelopes and exact-retry reconciliation.
 
-Ordinary Sol conversation stays ordinary: ``on_message`` never consumes
-text and never writes. Candidate creation happens only through the
-explicit ``propose_*`` entry points (wired to an explicit "Log meal"
-affordance by the Sol session layer), and no Health write ever happens
-before an explicit Confirm callback.
+Ordinary Sol conversation stays ordinary. Candidate creation happens only
+through the explicit ``/food`` text affordance or an authenticated bounded
+Sol photo, both of which call the ``propose_*`` entry points. No Health write
+ever happens before a separately authenticated Confirm callback.
 
 Privacy: no food text, labels, candidate payloads, photo paths, callback
 data, or credentials are ever logged — stable reason codes only.
@@ -92,7 +91,6 @@ _MSG_STALE = "These buttons are from an older version — use the newest message
 _MSG_RESOLVED = "This has already been resolved."
 _MSG_DENIED = "That action isn't valid here."
 _MSG_CANCELLED = "Cancelled — nothing was logged."
-_MSG_EDIT = "Send a corrected description and I'll update the options."
 _MSG_SELECT_FIRST = "Pick one option first, then confirm."
 _MSG_COMMIT_PENDING = "Confirmed — logging is pending and will retry safely."
 _MSG_MEDIA_REJECTED = "That image can't be used (format or size). JPEG/PNG/WebP up to 10 MiB."
@@ -194,9 +192,30 @@ class SolFoodHook(TopicPluginHook):
     async def on_message(
         self, route: TopicRoute, origin: RouteOrigin, text: str, reply: ReplyFn
     ) -> HookDecision:
-        # Ordinary Sol conversation remains ordinary conversation; food
-        # candidate creation is explicit (propose_from_text) and never
-        # implicit on every message.
+        # Ordinary Sol conversation remains ordinary. ``/food`` is the
+        # explicit transport affordance; parsing creates only a proposal and
+        # cannot write Health before a separately authenticated callback.
+        normalized = (text or "").strip()
+        if normalized == "/food" or normalized.startswith("/food "):
+            description = normalized[5:].strip()
+            if not description:
+                await reply("Tell me what you ate after /food.")
+                return HookDecision.CONSUME
+            active = await self._store.active_proposal(
+                origin.owner_chat_id, origin.thread_id
+            )
+            if active is None:
+                await self.propose_from_text(origin, description, reply)
+            else:
+                candidates = await self._run_parser(description, None)
+                if candidates is None:
+                    await reply("I couldn't read that as a meal — nothing changed.")
+                else:
+                    revised, tokens = await self._store.edit_new_version(
+                        active.proposal_id, candidates
+                    )
+                    await self._present_proposal(revised, tokens, reply)
+            return HookDecision.CONSUME
         return HookDecision.CONTINUE
 
     # ── generic seam: media pre-download ────────────────────────────────
@@ -234,12 +253,27 @@ class SolFoodHook(TopicPluginHook):
             return HookDecision.DENY
         if media.caption_length > FOOD_CAPTION_MAX_CHARS:
             logger.info("[sol-food] %s", REASON_CAPTION_TOO_LONG)
-            # Over-limit caption: the photo is not treated as food input;
-            # generic pipeline may continue (conversation), no proposal.
-            return HookDecision.CONTINUE
+            await reply("That caption is too long — please shorten it.")
+            return HookDecision.DENY
         return HookDecision.CONTINUE
 
-    # ── explicit proposal entry points (invoked by the Sol session layer) ──
+    async def on_media_downloaded(
+        self,
+        route: TopicRoute,
+        origin: RouteOrigin,
+        media: MediaDescriptor,
+        content: bytes,
+        caption: Optional[str],
+        reply: ReplyFn,
+    ) -> HookDecision:
+        if origin.thread_id != GENERAL_TOPIC_THREAD_ID:
+            return HookDecision.DENY
+        if media.kind != "photo":
+            return HookDecision.CONTINUE
+        await self.propose_from_photo(origin, content, caption, reply)
+        return HookDecision.CONSUME
+
+    # ── explicit proposal entry points ─────────────────────────────────
     async def propose_from_text(
         self, origin: RouteOrigin, text: str, reply: ReplyFn
     ) -> Optional[str]:
@@ -324,8 +358,37 @@ class SolFoodHook(TopicPluginHook):
             logger.info("[sol-food] %s", err.reason_code)
             await reply(_MSG_ACTIVE)
             return None
-        await reply(render_display(proposal.candidates))
+        await self._present_proposal(proposal, tokens, reply)
         return proposal.proposal_id
+
+    async def _present_proposal(
+        self,
+        proposal,
+        tokens: Mapping[str, str],
+        reply: ReplyFn,
+    ) -> None:
+        display = render_display(proposal.candidates)
+        presenter = getattr(reply, "present_actions", None)
+        if callable(presenter):
+            labels = {
+                ACTION_CONFIRM: "Confirm",
+                ACTION_EDIT: "Edit",
+                ACTION_CANCEL: "Cancel",
+            }
+            actions = []
+            for action, token in self.tokens_for_keyboard(tokens):
+                label = (
+                    f"Option {int(action.split(':', 1)[1]) + 1}"
+                    if action.startswith("choice:")
+                    else labels[action]
+                )
+                actions.append((label, token))
+            message_id = await presenter(display, actions)
+            await self.bind_presentation(proposal.proposal_id, message_id)
+        else:
+            # Test/alternate transports may provide text-only replies. Their
+            # proposals remain un-actionable until explicitly bound.
+            await reply(display)
 
     async def _run_parser(
         self, text: Optional[str], image_path: Optional[Path]
@@ -479,9 +542,7 @@ class SolFoodHook(TopicPluginHook):
             await reply(_MSG_CANCELLED)
             return
         if action == ACTION_EDIT:
-            # Transport keeps the proposal pending; the session layer
-            # collects the correction and calls edit_new_version().
-            await reply(_MSG_EDIT)
+            await reply("Send /food followed by the corrected description.")
             return
         if action.startswith("choice:"):
             index = int(action.split(":", 1)[1])
@@ -493,7 +554,7 @@ class SolFoodHook(TopicPluginHook):
             new_proposal, tokens = await self._store.edit_new_version(
                 proposal_id, [chosen]
             )
-            await reply(render_display(new_proposal.candidates))
+            await self._present_proposal(new_proposal, tokens, reply)
             return
         if action == ACTION_CONFIRM:
             await self._confirm(proposal_id, origin, reply)
@@ -511,10 +572,11 @@ class SolFoodHook(TopicPluginHook):
         if len(proposal.candidates) != 1:
             # Explicit selection first; un-consume is impossible (tokens
             # are one-shot) so re-present a fresh version for selection.
-            new_proposal, _tokens = await self._store.edit_new_version(
+            new_proposal, tokens = await self._store.edit_new_version(
                 proposal_id, list(proposal.candidates)
             )
             await reply(_MSG_SELECT_FIRST)
+            await self._present_proposal(new_proposal, tokens, reply)
             return
         candidate = proposal.candidates[0]
         # Freeze the exact Health envelope durably BEFORE first send.

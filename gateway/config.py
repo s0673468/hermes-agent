@@ -932,6 +932,28 @@ class GatewayConfig:
         from gateway.profile_routing import parse_profile_routes
         profile_routes = parse_profile_routes(data.get("profile_routes") or [])
 
+        # Strict topic admission and persona selection are two independent
+        # layers. Validate them together at startup so an admitted route can
+        # never silently execute under a different or default profile.
+        telegram = platforms.get(Platform.TELEGRAM)
+        topic_routing = telegram.extra.get("topic_routing") if telegram else None
+        if isinstance(topic_routing, dict) and topic_routing:
+            if str(topic_routing.get("mode", "")) != "strict":
+                raise ValueError("topic_routing.mode must be 'strict'")
+            from gateway.topic_routing import (
+                TopicRouteRegistry,
+                validate_topic_persona_alignment,
+            )
+
+            topic_registry = TopicRouteRegistry.from_config(
+                topic_routing.get("routes", [])
+            )
+            validate_topic_persona_alignment(
+                topic_registry,
+                profile_routes,
+                multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            )
+
         return cls(
             platforms=platforms,
             default_reset_policy=default_policy,

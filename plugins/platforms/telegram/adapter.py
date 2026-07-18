@@ -270,13 +270,13 @@ from gateway.platforms.base import (
     utf16_len,
 )
 from gateway.topic_hooks import (
+    create_topic_hook,
     HookDecision,
     MediaDescriptor,
     TopicHookRegistry,
     TopicPluginHook,
 )
 from gateway.topic_routing import (
-    GENERAL_TOPIC_THREAD_ID,
     RouteDenied,
     RouteOrigin,
     TopicRoute,
@@ -527,6 +527,7 @@ class TelegramAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
+    _STRICT_MESSAGE_ORIGIN_CAP = 4096
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -728,6 +729,33 @@ class TelegramAdapter(BasePlatformAdapter):
             self._topic_route_registry = TopicRouteRegistry.from_config(
                 _topic_routing_cfg.get("routes", [])
             )
+            _hook_entries = _topic_routing_cfg.get("hooks", [])
+            if not isinstance(_hook_entries, list):
+                raise ValueError("topic_routing.hooks must be a list")
+            _hook_profiles: List[str] = []
+            _validated_hooks: List[Tuple[str, str]] = []
+            for entry in _hook_entries:
+                if not isinstance(entry, dict) or set(entry) != {"profile", "plugin"}:
+                    raise ValueError(
+                        "topic_routing.hooks entry requires exact profile and plugin keys"
+                    )
+                profile = entry["profile"]
+                plugin = entry["plugin"]
+                if (
+                    not isinstance(profile, str)
+                    or not profile.strip()
+                    or not isinstance(plugin, str)
+                    or not plugin.strip()
+                ):
+                    raise ValueError(
+                        "topic_routing.hooks values must be non-empty strings"
+                    )
+                _hook_profiles.append(profile)
+                _validated_hooks.append((profile, plugin))
+            if len(set(_hook_profiles)) != len(_hook_profiles):
+                raise ValueError("topic_routing.hooks contains duplicate profiles")
+            for profile, plugin in _validated_hooks:
+                self.register_topic_hook(create_topic_hook(profile, owner=plugin))
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
@@ -761,10 +789,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # "all"       — every message triggers a push notification (legacy
         #               behavior; opt-in via display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
-        # send_or_update_status() bookkeeping: {(chat_id, status_key) -> bot message_id}
-        # Tracks status bubbles owned by this adapter so subsequent calls with the
-        # same key edit the same message instead of appending new ones (#30045).
+        # send_or_update_status() bookkeeping. Non-strict mode uses
+        # (chat_id, status_key); strict mode uses
+        # (chat_id, thread_id, status_key). Tracks status bubbles owned by this
+        # adapter so subsequent calls with the same exact key edit in place.
         self._status_message_ids: Dict[tuple, str] = {}
+        # Strict-mode bot message ownership. Edits/deletes are destructive
+        # mutations and must prove the target message was created for the
+        # exact registered origin tuple, not merely that the destination
+        # thread itself exists.
+        self._strict_message_origins: Dict[tuple[str, str], int] = {}
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 4096 preview cap,
         # every subsequent progressive edit truncates to the SAME text; sending
@@ -1022,22 +1056,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _strict_thread_key(msg: Any) -> Any:
-        """Thread key for strict routing, with ONE deterministic
-        platform normalization: in a *private* chat, a message that
-        carries no ``message_thread_id`` and is not a topic message IS
-        the non-deletable General lane, which Telegram encodes
-        implicitly — its canonical id is 1. Explicit thread ids are
-        never rewritten, group/supergroup messages are never
-        normalized, and nothing here consults history or "last active"
-        state; unregistered keys still fail closed in the registry."""
-        raw = getattr(msg, "message_thread_id", None)
-        if raw is not None:
-            return raw
-        chat = getattr(msg, "chat", None)
-        chat_type = getattr(chat, "type", None)
-        if str(chat_type) == "private" and not getattr(msg, "is_topic_message", False):
-            return GENERAL_TOPIC_THREAD_ID
-        return None
+        """Return only the thread id carried by the inbound update.
+
+        Strict topic mode never promotes a root/missing private-chat update to
+        General/1. Threaded private-chat updates identify General explicitly
+        as ``message_thread_id=1``; accepting a missing id as Sol would turn a
+        malformed, legacy, or non-topic delivery into an authenticated route.
+        """
+        return getattr(msg, "message_thread_id", None)
 
     #: Sentinel: strict topic mode is off; proceed with legacy behavior.
     _TOPIC_GATE_OFF = object()
@@ -1078,17 +1104,38 @@ class TelegramAdapter(BasePlatformAdapter):
         """Build the origin-bound reply callable handed to topic hooks.
 
         Destination is pinned to the origin (owner chat + registered
-        thread); hooks cannot select any other destination. General (1)
-        omits ``message_thread_id`` per Telegram's send semantics."""
+        thread); hooks cannot select any other destination. General/1 stays
+        explicit: strict mode never relies on Telegram's threadless fallback.
+        """
 
         async def _reply(text: str) -> None:
             bot = self._bot
             if bot is None:
                 return
-            kwargs: Dict[str, Any] = {}
-            if str(origin.thread_id) != self._GENERAL_TOPIC_THREAD_ID:
-                kwargs["message_thread_id"] = origin.thread_id
-            await bot.send_message(chat_id=origin.owner_chat_id, text=text, **kwargs)
+            await bot.send_message(
+                chat_id=origin.owner_chat_id,
+                text=text,
+                message_thread_id=origin.thread_id,
+            )
+
+        async def _present_actions(text: str, actions: List[tuple[str, str]]) -> int:
+            """Present opaque actions at the exact origin and return message id."""
+            bot = self._bot
+            if bot is None:
+                raise RuntimeError("topic_origin_unavailable")
+            rows = [
+                [InlineKeyboardButton(label, callback_data=token)]
+                for label, token in actions
+            ]
+            message = await bot.send_message(
+                chat_id=origin.owner_chat_id,
+                text=text,
+                message_thread_id=origin.thread_id,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return int(message.message_id)
+
+        _reply.present_actions = _present_actions  # type: ignore[attr-defined]
 
         return _reply
 
@@ -1154,12 +1201,92 @@ class TelegramAdapter(BasePlatformAdapter):
             or metadata.get("telegram_dm_topic_created_for_send")
         ):
             return "topic_route_send_fallback_denied"
-        thread_key: Any = thread_id if thread_id else GENERAL_TOPIC_THREAD_ID
         try:
-            registry.resolve(chat_id, thread_key)
+            registry.resolve(chat_id, thread_id)
         except RouteDenied as denied:
             return denied.reason_code
         return None
+
+    def _bind_callback_state(
+        self, value: Any, chat_id: Any, thread_id: Optional[str]
+    ) -> Any:
+        """Bind interactive state to its exact strict-mode origin tuple."""
+        if getattr(self, "_topic_route_registry", None) is None:
+            return value
+        return {
+            "value": value,
+            "origin": (str(chat_id), str(thread_id) if thread_id is not None else None),
+        }
+
+    def _callback_state_value(
+        self, state: Any, chat_id: Any, thread_id: Any
+    ) -> Any:
+        """Return state value only when its strict origin exactly matches."""
+        if getattr(self, "_topic_route_registry", None) is None:
+            return state
+        if not isinstance(state, dict) or set(state) != {"value", "origin"}:
+            return None
+        expected = (str(chat_id), str(thread_id) if thread_id is not None else None)
+        if tuple(state["origin"]) != expected:
+            return None
+        return state["value"]
+
+    def _model_picker_key(self, chat_id: Any, thread_id: Any = None) -> Any:
+        if getattr(self, "_topic_route_registry", None) is None:
+            return str(chat_id)
+        return (str(chat_id), str(thread_id) if thread_id is not None else None)
+
+    def _record_strict_message_origin(
+        self,
+        chat_id: Any,
+        message_id: Any,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        if getattr(self, "_topic_route_registry", None) is None or message_id is None:
+            return
+        thread_id = self._metadata_thread_id(metadata)
+        if self._strict_outbound_denied(chat_id, thread_id, metadata) is not None:
+            return
+        origins = self.__dict__.setdefault("_strict_message_origins", {})
+        key = (str(chat_id), str(message_id))
+        origins.pop(key, None)
+        origins[key] = int(thread_id)
+        cap = max(1, int(getattr(self, "_STRICT_MESSAGE_ORIGIN_CAP", 4096)))
+        while len(origins) > cap:
+            origins.pop(next(iter(origins)))
+
+    def _strict_message_mutation_denied(
+        self,
+        chat_id: Any,
+        message_id: Any,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        if getattr(self, "_topic_route_registry", None) is None:
+            return None
+        thread_id = self._metadata_thread_id(metadata)
+        denied = self._strict_outbound_denied(chat_id, thread_id, metadata)
+        if denied is not None:
+            return denied
+        expected = self.__dict__.setdefault("_strict_message_origins", {}).get(
+            (str(chat_id), str(message_id))
+        )
+        if expected is None or expected != int(thread_id):
+            return "topic_route_message_origin_mismatch"
+        return None
+
+    def _status_cache_key(
+        self,
+        chat_id: Any,
+        status_key: Any,
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple:
+        if getattr(self, "_topic_route_registry", None) is None:
+            return (str(chat_id), str(status_key))
+        return (
+            str(chat_id),
+            self._metadata_thread_id(metadata),
+            str(status_key),
+        )
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -4089,6 +4216,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
+                        self._record_strict_message_origin(
+                            chat_id, rich_result.message_id, metadata
+                        )
                         # Re-trigger typing like the legacy success path does,
                         # but ONLY for intermediate sends. On the final reply
                         # (metadata["notify"]) the gateway has already torn down
@@ -4368,6 +4498,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
+            for delivered_id in message_ids:
+                self._record_strict_message_origin(chat_id, delivered_id, metadata)
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -4400,6 +4532,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 # receipt. The generic retry layer recognizes partial_send and
                 # returns it unchanged.
                 delivered_count = len(delivered_ids)
+                for delivered_id in delivered_ids:
+                    self._record_strict_message_origin(
+                        chat_id, delivered_id, metadata
+                    )
                 return SendResult(
                     success=False,
                     message_id=delivered_ids[0],
@@ -4455,11 +4591,11 @@ class TelegramAdapter(BasePlatformAdapter):
         Issue #30045: progress/status callbacks (context-pressure, lifecycle,
         compression, etc.) used to append a fresh bubble on every call. With
         this method, the first call sends and the message id is remembered;
-        subsequent calls with the same (chat_id, status_key) edit that same
-        message in place. If the edit fails (message deleted, too old, etc.)
-        we drop the cached id and send fresh.
+        subsequent calls with the same key edit that same message in place.
+        Strict topic mode includes thread_id in the key. If the edit fails
+        (message deleted, too old, etc.) we drop the cached id and send fresh.
         """
-        key = (str(chat_id), str(status_key))
+        key = self._status_cache_key(chat_id, status_key, metadata)
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(
@@ -4497,6 +4633,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        mutation_denied = self._strict_message_mutation_denied(
+            chat_id, message_id, metadata
+        )
+        if mutation_denied:
+            return SendResult(success=False, error=mutation_denied, retryable=False)
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -4885,6 +5027,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     continuation_message_ids=tuple(continuation_ids),
                 )
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
+            self._record_strict_message_origin(chat_id, new_id, metadata)
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
             prev_id = new_id
@@ -4900,7 +5043,12 @@ class TelegramAdapter(BasePlatformAdapter):
             continuation_message_ids=tuple(continuation_ids),
         )
 
-    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Delete a previously sent Telegram message.
 
         Used by the stream consumer's fresh-final cleanup path (ported
@@ -4912,10 +5060,15 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return False
+        if self._strict_message_mutation_denied(chat_id, message_id, metadata):
+            return False
         try:
             await self._bot.delete_message(
                 chat_id=normalize_telegram_chat_id(chat_id),
                 message_id=int(message_id),
+            )
+            self.__dict__.setdefault("_strict_message_origins", {}).pop(
+                (str(chat_id), str(message_id)), None
             )
             return True
         except Exception as e:
@@ -5148,6 +5301,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
@@ -5206,7 +5364,9 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            self._approval_state[approval_id] = self._bind_callback_state(
+                session_key, chat_id, thread_id
+            )
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -5220,6 +5380,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Render a three-button slash-command confirmation prompt."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
 
         try:
             preview = self.format_message(message if len(message) <= 3800 else message[:3800] + "...")
@@ -5255,7 +5420,9 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
-            self._slash_confirm_state[confirm_id] = session_key
+            self._slash_confirm_state[confirm_id] = self._bind_callback_state(
+                session_key, chat_id, thread_id
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
@@ -5283,6 +5450,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
 
         try:
             text = f"❓ {_html.escape(question)}"
@@ -5337,7 +5509,9 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
-            self._clarify_state[clarify_id] = session_key
+            self._clarify_state[clarify_id] = self._bind_callback_state(
+                session_key, chat_id, thread_id
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
@@ -5360,6 +5534,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
 
         try:
             from hermes_cli.providers import get_label
@@ -5399,8 +5578,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            # Store picker state keyed by chat_id
-            self._model_picker_state[str(chat_id)] = {
+            # Strict mode keys picker state by the exact origin tuple.
+            self._model_picker_state[self._model_picker_key(chat_id, thread_id)] = {
                 "msg_id": msg.message_id,
                 "providers": providers,
                 "session_key": session_key,
@@ -5534,7 +5713,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
-        state = self._model_picker_state.get(chat_id)
+        thread_id = getattr(getattr(query, "message", None), "message_thread_id", None)
+        state_key = self._model_picker_key(chat_id, thread_id)
+        state = self._model_picker_state.get(state_key)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
             return
@@ -5697,7 +5878,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(
                 text="Switch failed." if switch_failed else "Model switched!"
             )
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mm:"):
             # --- Model selected: perform the switch ---
@@ -5780,7 +5961,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             # Clean up state
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mpg:"):
             # --- Provider group selected: show member providers ---
@@ -5854,7 +6035,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif data == "mx":
             # --- Cancel ---
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
             await query.edit_message_text(
                 text="Model selection cancelled.",
                 reply_markup=None,
@@ -5923,6 +6104,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if strict_gate is not self._TOPIC_GATE_OFF:
             strict_route, strict_origin = strict_gate
+            # In strict mode authorization precedes every callback namespace,
+            # including plugin-owned prefixes.  No hook or built-in state may
+            # observe an unauthorized action.
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                try:
+                    await query.answer(text="⛔ You are not authorized to use this action.")
+                except Exception:
+                    pass
+                return
             if self._topic_hooks.owns_callback(data):
                 try:
                     await query.answer()
@@ -5978,10 +6175,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                stored_state = self._approval_state.get(approval_id)
+                session_key = self._callback_state_value(
+                    stored_state, query_chat_id, query_thread_id
+                )
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
+                self._approval_state.pop(approval_id, None)
 
                 # Map choice to human-readable label
                 label_map = {
@@ -6044,10 +6245,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return
 
-                session_key = self._slash_confirm_state.pop(confirm_id, None)
+                stored_state = self._slash_confirm_state.get(confirm_id)
+                session_key = self._callback_state_value(
+                    stored_state, query_chat_id, query_thread_id
+                )
                 if not session_key:
                     await query.answer(text="This prompt has already been resolved.")
                     return
+                self._slash_confirm_state.pop(confirm_id, None)
 
                 label_map = {
                     "once": "✅ Approved once",
@@ -6144,7 +6349,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
                     return
 
-                session_key = self._clarify_state.get(clarify_id)
+                stored_state = self._clarify_state.get(clarify_id)
+                session_key = self._callback_state_value(
+                    stored_state, query_chat_id, query_thread_id
+                )
                 if not session_key:
                     await query.answer(text="This prompt has already been resolved.")
                     return
@@ -6447,7 +6655,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
+
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
@@ -6547,6 +6760,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return
         if not images:
+            return
+        if self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        ):
             return
 
         try:
@@ -6674,6 +6891,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
+
         try:
             if not os.path.exists(image_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
@@ -6768,6 +6991,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
+
         try:
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
@@ -6821,6 +7050,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
+
         try:
             if not os.path.exists(video_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Video", video_path))
@@ -6873,6 +7108,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
 
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
@@ -6963,7 +7204,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+        denied = self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        )
+        if denied:
+            return SendResult(success=False, error=denied)
+
         try:
             _anim_thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
@@ -7047,6 +7293,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot or self._typing_in_cooldown(chat_id):
             return
 
+        if self._strict_outbound_denied(
+            chat_id, self._metadata_thread_id(metadata), metadata
+        ):
+            return
+
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
         try:
@@ -7063,7 +7314,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # For DM topic lanes, Telegram may reject message_thread_id.
             # Fall back to sending typing without thread_id so the typing
             # indicator at least appears in the main DM view.
-            if _is_dm_topic and message_thread_id is not None:
+            if (
+                getattr(self, "_topic_route_registry", None) is None
+                and _is_dm_topic
+                and message_thread_id is not None
+            ):
                 try:
                     await self._bot.send_chat_action(
                         chat_id=normalize_telegram_chat_id(chat_id),
@@ -8181,6 +8436,16 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         if gate is None:
             return
+        if gate is not self._TOPIC_GATE_OFF:
+            route, origin = gate
+            decision = await self._topic_hooks.dispatch_message(
+                route,
+                origin,
+                msg.text,
+                self._origin_reply(origin),
+            )
+            if decision is not HookDecision.CONTINUE:
+                return
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
@@ -8418,6 +8683,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         # Strict topic routing: route + owner auth resolve BEFORE any
         # media download; hooks get a pre-download veto (fail closed).
+        strict_media_route = None
+        strict_media_origin = None
         gate = self._resolve_topic_route(
             getattr(getattr(update.message, "chat", None), "id", None),
             self._strict_thread_key(update.message),
@@ -8428,6 +8695,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if gate is not self._TOPIC_GATE_OFF:
             route, origin = gate
+            strict_media_route, strict_media_origin = route, origin
             decision = await self._topic_hooks.dispatch_media_pre_download(
                 route,
                 origin,
@@ -8479,6 +8747,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 file_obj = await photo.get_file()
                 # Download the image bytes directly into memory
                 image_bytes = await file_obj.download_as_bytearray()
+                if strict_media_route is not None and strict_media_origin is not None:
+                    decision = await self._topic_hooks.dispatch_media_downloaded(
+                        strict_media_route,
+                        strict_media_origin,
+                        self._topic_media_descriptor(msg),
+                        bytes(image_bytes),
+                        msg.caption,
+                        self._origin_reply(strict_media_origin),
+                    )
+                    if decision is not HookDecision.CONTINUE:
+                        return
                 # Determine extension from the file path if available
                 ext = ".jpg"
                 if file_obj.file_path:
