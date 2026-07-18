@@ -219,6 +219,28 @@ class TestInboundTextGate:
         assert hook.calls == [("message", 1, 6010)]
         adapter._ensure_forum_commands.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_bot_addressed_food_command_is_normalized_before_strict_hook(self):
+        adapter = make_adapter()
+        adapter._bot.username = "HermesBot"
+        hook = RecordingHook(HookDecision.CONSUME)
+        hook.on_message = AsyncMock(return_value=HookDecision.CONSUME)
+        adapter.register_topic_hook(hook)
+        adapter._should_process_message = MagicMock(return_value=True)
+        adapter._is_user_authorized_from_message = lambda msg: True
+        adapter._ensure_forum_commands = AsyncMock()
+        msg = make_msg(
+            text="/food@HermesBot synthetic meal",
+            thread_id=1,
+            chat_type="private",
+            is_topic=True,
+        )
+
+        await adapter._handle_command(make_update(msg, update_id=6011), None)
+
+        assert hook.on_message.await_args.args[2] == "/food synthetic meal"
+        adapter._ensure_forum_commands.assert_not_called()
+
 
 class TestInboundMediaGate:
     @pytest.mark.asyncio
@@ -304,6 +326,7 @@ class TestCallbackGate:
             message=message,
             from_user=SimpleNamespace(id=OWNER_ID, first_name="German"),
             answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
         )
 
     @pytest.mark.asyncio
@@ -386,6 +409,79 @@ class TestCallbackGate:
         )
         assert adapter._model_picker_key(OWNER, 77) in adapter._model_picker_state
         query.answer.assert_awaited_with(text="Picker expired — use /model again.")
+
+    @pytest.mark.asyncio
+    async def test_general_raw_none_exec_callback_uses_thread_one_state(self):
+        adapter = make_adapter()
+        auth_calls = []
+        adapter._is_callback_user_authorized = (
+            lambda *_a, **kw: auth_calls.append(kw) or True
+        )
+        adapter._approval_state = {
+            7: adapter._bind_callback_state("session", OWNER, "1")
+        }
+        adapter.resume_typing_for_chat = MagicMock()
+        query = self._query(thread_id=None, data="ea:once:7")
+        query.message.chat.type = "supergroup"
+        query.message.chat.is_forum = True
+        query.message.is_topic_message = True
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            await adapter._handle_callback_query(
+                SimpleNamespace(update_id=7012, callback_query=query), None
+            )
+
+        assert 7 not in adapter._approval_state
+        assert auth_calls[-1]["thread_id"] == "1"
+        query.answer.assert_awaited_with(text="✅ Approved once")
+
+    @pytest.mark.asyncio
+    async def test_general_raw_none_model_callback_uses_thread_one_state(self):
+        adapter = make_adapter()
+        adapter._is_callback_user_authorized = lambda *_a, **_kw: True
+        adapter._model_picker_state = {
+            adapter._model_picker_key(OWNER, 1): {"session_key": "sol"}
+        }
+        query = self._query(thread_id=None, data="mx")
+        query.message.chat.type = "supergroup"
+        query.message.chat.is_forum = True
+        query.message.is_topic_message = True
+
+        await adapter._handle_callback_query(
+            SimpleNamespace(update_id=7013, callback_query=query), None
+        )
+
+        assert adapter._model_picker_key(OWNER, 1) not in adapter._model_picker_state
+        query.answer.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_general_raw_none_slash_followup_preserves_strict_origin(self):
+        adapter = make_adapter()
+        adapter._is_callback_user_authorized = lambda *_a, **_kw: True
+        adapter._slash_confirm_state = {
+            "confirm-8": adapter._bind_callback_state("session", OWNER, "1")
+        }
+        adapter._reply_to_mode = "on"
+        adapter._link_preview_kwargs = lambda: {}
+        adapter._send_message_with_thread_fallback = AsyncMock(
+            return_value=SimpleNamespace(message_id=93)
+        )
+        query = self._query(thread_id=None, data="sc:once:confirm-8")
+        query.message.chat.type = "supergroup"
+        query.message.chat.is_forum = True
+        query.message.is_topic_message = True
+
+        with patch(
+            "tools.slash_confirm.resolve",
+            new=AsyncMock(return_value="completed"),
+        ):
+            await adapter._handle_callback_query(
+                SimpleNamespace(update_id=7014, callback_query=query), None
+            )
+
+        sent = adapter._send_message_with_thread_fallback.await_args.kwargs
+        assert sent["message_thread_id"] is None
+        assert adapter._strict_message_origins[(OWNER, "93")] == 1
 
     @pytest.mark.asyncio
     async def test_foreign_chat_callback_fails_closed(self):

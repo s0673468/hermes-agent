@@ -5731,7 +5731,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
-        thread_id = getattr(getattr(query, "message", None), "message_thread_id", None)
+        query_message = getattr(query, "message", None)
+        thread_id = getattr(query_message, "message_thread_id", None)
+        if getattr(self, "_topic_route_registry", None) is not None:
+            thread_id = self._strict_thread_key(query_message)
         state_key = self._model_picker_key(chat_id, thread_id)
         state = self._model_picker_state.get(state_key)
         if not state:
@@ -6102,6 +6105,8 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat = getattr(query_message, "chat", None)
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
+        if getattr(self, "_topic_route_registry", None) is not None:
+            query_thread_id = self._strict_thread_key(query_message)
         query_user_name = getattr(query.from_user, "first_name", None)
 
         # Strict topic routing: validate the callback's origin BEFORE any
@@ -6110,7 +6115,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # dispatched to their owning hook and never fall through.
         strict_gate = self._resolve_topic_route(
             getattr(query_chat, "id", None) if query_chat is not None else query_chat_id,
-            self._strict_thread_key(query_message) if query_message is not None else None,
+            query_thread_id,
             getattr(update, "update_id", None),
             getattr(query_message, "message_id", None),
         )
@@ -6304,7 +6309,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # Inherit the prompt message's topic. Supergroup forums
                         # use message_thread_id; Telegram private DM-topic lanes
                         # need both the private topic id and the prompt reply anchor.
-                        thread_id = getattr(query.message, "message_thread_id", None)
+                        thread_id = query_thread_id
                         chat = getattr(query.message, "chat", None)
                         chat_type = getattr(chat, "type", None)
                         prompt_message_id = getattr(query.message, "message_id", None)
@@ -6344,7 +6349,18 @@ class TelegramAdapter(BasePlatformAdapter):
                                     reply_to_mode=self._reply_to_mode
                                 )
                             )
-                        await self._send_message_with_thread_fallback(**send_kwargs)
+                        sent_message = await self._send_message_with_thread_fallback(
+                            **send_kwargs
+                        )
+                        self._record_strict_message_origin(
+                            str(query.message.chat_id),
+                            getattr(sent_message, "message_id", None),
+                            (
+                                {"thread_id": str(thread_id)}
+                                if thread_id is not None
+                                else None
+                            ),
+                        )
                 except Exception as exc:
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
             return
@@ -7927,7 +7943,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if not text or not self._bot or not getattr(self._bot, "username", None):
             return text
         username = re.escape(self._bot.username)
-        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
+        # Telegram addresses group commands as ``/cmd@botname args``. Remove
+        # that address without consuming the command/argument separator; the
+        # generic mention cleaner below intentionally consumes trailing space.
+        command_cleaned = re.sub(
+            rf"(?i)^(/[A-Za-z0-9_]+)@{username}\b",
+            r"\1",
+            text,
+        )
+        cleaned = re.sub(
+            rf"(?i)@{username}\b[,:\-]*\s*", "", command_cleaned
+        ).strip()
         return cleaned or text
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
@@ -8415,7 +8441,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if gate is not self._TOPIC_GATE_OFF:
             route, origin = gate
             decision = await self._topic_hooks.dispatch_message(
-                route, origin, msg.text or "", self._origin_reply(origin)
+                route,
+                origin,
+                self._clean_bot_trigger_text(msg.text) or "",
+                self._origin_reply(origin),
             )
             if decision is not HookDecision.CONTINUE:
                 return
@@ -8459,7 +8488,7 @@ class TelegramAdapter(BasePlatformAdapter):
             decision = await self._topic_hooks.dispatch_message(
                 route,
                 origin,
-                msg.text,
+                self._clean_bot_trigger_text(msg.text),
                 self._origin_reply(origin),
             )
             if decision is not HookDecision.CONTINUE:

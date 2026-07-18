@@ -382,3 +382,31 @@ class TestStrictPersonaAlignment:
             "atlas",
             "metis",
         }
+
+    def test_disabled_telegram_leaves_stale_topic_routing_inert(self):
+        from gateway.config import GatewayConfig, Platform
+
+        config = GatewayConfig.from_dict(
+            {
+                "platforms": {
+                    "telegram": {
+                        "enabled": False,
+                        "token": "synthetic-test-token",
+                        "extra": {
+                            "topic_routing": {
+                                "mode": "legacy-stale-value",
+                                "routes": [
+                                    {
+                                        "chat_id": OWNER_CHAT,
+                                        "thread_id": 1,
+                                        "profile": "sol",
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
+        assert config.platforms[Platform.TELEGRAM].enabled is False

@@ -936,7 +936,11 @@ class GatewayConfig:
         # layers. Validate them together at startup so an admitted route can
         # never silently execute under a different or default profile.
         telegram = platforms.get(Platform.TELEGRAM)
-        topic_routing = telegram.extra.get("topic_routing") if telegram else None
+        topic_routing = (
+            telegram.extra.get("topic_routing")
+            if telegram is not None and telegram.enabled
+            else None
+        )
         if isinstance(topic_routing, dict) and topic_routing:
             if str(topic_routing.get("mode", "")) != "strict":
                 raise ValueError("topic_routing.mode must be 'strict'")
